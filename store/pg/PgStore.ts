@@ -3,6 +3,10 @@ import type {
   MenuItem,
   Order,
   OrderItem,
+  OrderItemStatus,
+  OrderStatus,
+  OrderType,
+  PackageType,
   User,
 } from "../../shared/contracts.ts";
 import { db } from "../../db/client.ts";
@@ -19,26 +23,70 @@ interface PgStoreOptions {
 }
 
 interface SeedStore {
-  users?: User[];
+  users?: Array<Partial<User> & { id?: string | number }>;
   menu?: MenuItem[];
-  orders?: Array<{
-    id: number;
-    userId: number;
-    status: "pending" | "submitted";
-    total: number;
-    createdAt: string;
-    submittedAt?: string;
-    items: Array<{ item: MenuItem; qty: number }>;
-  }>;
+  orders?: Array<
+    Partial<Order> & {
+      userId?: string | number;
+      items?: Array<{ item: MenuItem; qty: number; note?: string }>;
+    }
+  >;
 }
+
+const orderStatuses = new Set<OrderStatus>([
+  "pending",
+  "submitted",
+  "preparing",
+  "ready",
+  "completed",
+  "cancelled",
+]);
 
 function toSafeUser(user: User): Omit<User, "password"> {
   const { password: _password, ...safeUser } = user;
   return safeUser;
 }
 
+function toUserId(value: unknown, fallback = "1"): string {
+  if (typeof value === "string" && value.length > 0) {
+    return value;
+  }
+
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return String(value);
+  }
+
+  return fallback;
+}
+
 function calculateTotal(items: ReadonlyArray<OrderItem>): number {
   return items.reduce((sum, item) => sum + item.item.price * item.qty, 0);
+}
+
+function estimateReadyAt(order: Order, activeOrders: ReadonlyArray<Order>): string {
+  const activeAhead = activeOrders.filter((targetOrder) =>
+    ["submitted", "preparing"].includes(targetOrder.status),
+  ).length;
+  const cookingMinutes = order.items.reduce((sum, orderItem) => {
+    return sum + (orderItem.item.default_time || 5) * orderItem.qty;
+  }, 0);
+  const packagingMinutes =
+    order.packageType === "separate"
+      ? Math.max(2, order.items.reduce((sum, item) => sum + item.qty, 0))
+      : 2;
+  const minutes = Math.max(3, activeAhead * 3 + cookingMinutes + packagingMinutes);
+  return new Date(Date.now() + minutes * 60_000).toISOString();
+}
+
+function generatePickupCode(orderId: number): string {
+  const suffix = Math.random().toString(36).slice(2, 6).toUpperCase();
+  return `BF${String(orderId).padStart(4, "0")}${suffix}`;
+}
+
+function normalizeStatus(status: unknown): OrderStatus {
+  return typeof status === "string" && orderStatuses.has(status as OrderStatus)
+    ? (status as OrderStatus)
+    : "pending";
 }
 
 function normalizeSeedData(seed: SeedStore): Required<SeedStore> {
@@ -62,7 +110,6 @@ export class PgStore implements Store {
 
   async init(): Promise<void> {
     await db.execute(sql`select 1`);
-
     await this.seedFromJsonIfEmpty();
     await this.reloadFromDatabase();
   }
@@ -87,17 +134,17 @@ export class PgStore implements Store {
     };
   }
 
-  getUserById(userId: number): Omit<User, "password"> | undefined {
+  getUserById(userId: string): Omit<User, "password"> | undefined {
     const user = this.users.find((targetUser) => targetUser.id === userId);
-    if (!user) {
-      return undefined;
-    }
-
-    return toSafeUser(user);
+    return user ? toSafeUser(user) : undefined;
   }
 
   getMenu(): ReadonlyArray<MenuItem> {
     return this.menu;
+  }
+
+  getMenuItem(menuId: number): MenuItem | undefined {
+    return this.menu.find((item) => item.id === menuId);
   }
 
   async createMenuItem(input: {
@@ -106,6 +153,8 @@ export class PgStore implements Store {
     category: string;
     description: string;
     image_url: string;
+    default_time?: number;
+    is_available?: boolean;
   }): Promise<MenuItem> {
     const [inserted] = await db
       .insert(menuItemsTable)
@@ -115,6 +164,8 @@ export class PgStore implements Store {
         category: input.category,
         description: input.description,
         imageUrl: input.image_url,
+        defaultTime: input.default_time ?? 5,
+        isAvailable: input.is_available ?? true,
       })
       .returning();
 
@@ -129,6 +180,8 @@ export class PgStore implements Store {
       category: inserted.category,
       description: inserted.description,
       image_url: inserted.imageUrl,
+      default_time: inserted.defaultTime,
+      is_available: inserted.isAvailable,
     };
 
     this.menu.push(createdItem);
@@ -137,13 +190,7 @@ export class PgStore implements Store {
 
   async updateMenuItem(
     menuId: number,
-    patch: {
-      name?: string;
-      price?: number;
-      category?: string;
-      description?: string;
-      image_url?: string;
-    },
+    patch: Partial<MenuItem>,
   ): Promise<MenuItem | null> {
     const [updated] = await db
       .update(menuItemsTable)
@@ -155,6 +202,12 @@ export class PgStore implements Store {
           ? { description: patch.description }
           : {}),
         ...(patch.image_url !== undefined ? { imageUrl: patch.image_url } : {}),
+        ...(patch.default_time !== undefined
+          ? { defaultTime: patch.default_time }
+          : {}),
+        ...(patch.is_available !== undefined
+          ? { isAvailable: patch.is_available }
+          : {}),
       })
       .where(eq(menuItemsTable.id, menuId))
       .returning();
@@ -170,6 +223,8 @@ export class PgStore implements Store {
       category: updated.category,
       description: updated.description,
       image_url: updated.imageUrl,
+      default_time: updated.defaultTime,
+      is_available: updated.isAvailable,
     };
 
     const targetIndex = this.menu.findIndex((item) => item.id === menuId);
@@ -197,6 +252,8 @@ export class PgStore implements Store {
       category: removed.category,
       description: removed.description,
       image_url: removed.imageUrl,
+      default_time: removed.defaultTime,
+      is_available: removed.isAvailable,
     };
 
     const targetIndex = this.menu.findIndex((item) => item.id === menuId);
@@ -211,17 +268,15 @@ export class PgStore implements Store {
     return this.orders;
   }
 
-  getCurrentOrderByUserId(userId: number): Order | undefined {
+  getCurrentOrderByUserId(userId: string): Order | undefined {
     return this.orders.find(
       (order) => order.userId === userId && order.status === "pending",
     );
   }
 
-  getOrderHistoryByUserId(userId: number): ReadonlyArray<Order> {
+  getOrderHistoryByUserId(userId: string): ReadonlyArray<Order> {
     return this.orders
-      .filter(
-        (order) => order.userId === userId && order.status === "submitted",
-      )
+      .filter((order) => order.userId === userId && order.status !== "pending")
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   }
 
@@ -229,7 +284,12 @@ export class PgStore implements Store {
     return this.orders.find((order) => order.id === orderId);
   }
 
-  async createOrder(input: { userId: number }): Promise<Order> {
+  async createOrder(input: {
+    userId: string;
+    orderType?: OrderType;
+    packageType?: PackageType;
+    tableId?: number;
+  }): Promise<Order> {
     const createdAt = new Date();
 
     const [inserted] = await db
@@ -251,56 +311,76 @@ export class PgStore implements Store {
       userId: inserted.userId,
       items: [],
       total: inserted.total,
-      status: inserted.status === "submitted" ? "submitted" : "pending",
+      status: "pending",
+      orderType: input.orderType ?? "takeout",
+      packageType: input.packageType ?? "together",
+      tableId: input.tableId,
       createdAt:
         inserted.createdAt instanceof Date
           ? inserted.createdAt.toISOString()
           : new Date(inserted.createdAt).toISOString(),
-      submittedAt: inserted.submittedAt
-        ? inserted.submittedAt instanceof Date
-          ? inserted.submittedAt.toISOString()
-          : new Date(inserted.submittedAt).toISOString()
-        : undefined,
     };
 
     this.orders.push(order);
     return order;
   }
 
+  async configureOrder(
+    orderId: number,
+    input: {
+      userId: string;
+      orderType?: OrderType;
+      packageType?: PackageType;
+      tableId?: number | null;
+    },
+  ) {
+    const order = this.orders.find((targetOrder) => targetOrder.id === orderId);
+    if (!order) {
+      return { ok: false as const, code: "ORDER_NOT_FOUND" as const };
+    }
+    if (order.userId !== input.userId) {
+      return { ok: false as const, code: "ORDER_NOT_OWNED" as const };
+    }
+    if (order.status !== "pending") {
+      return { ok: false as const, code: "ORDER_NOT_EDITABLE" as const };
+    }
+
+    order.orderType = input.orderType ?? order.orderType;
+    order.packageType = input.packageType ?? order.packageType;
+    if (input.tableId === null) {
+      delete order.tableId;
+    } else {
+      order.tableId = input.tableId ?? order.tableId;
+    }
+
+    return { ok: true as const, order };
+  }
+
   async updateOrderItem(
     orderId: number,
     input: {
-      userId: number;
+      userId: string;
       itemId: number;
       qty: number;
+      note?: string;
     },
-  ): Promise<
-    | { ok: true; order: Order }
-    | {
-        ok: false;
-        code:
-          | "ORDER_NOT_FOUND"
-          | "MENU_ITEM_NOT_FOUND"
-          | "ORDER_NOT_OWNED"
-          | "ORDER_NOT_EDITABLE";
-      }
-  > {
+  ) {
     const order = this.orders.find((targetOrder) => targetOrder.id === orderId);
     if (!order) {
-      return { ok: false, code: "ORDER_NOT_FOUND" };
+      return { ok: false as const, code: "ORDER_NOT_FOUND" as const };
     }
 
     if (order.userId !== input.userId) {
-      return { ok: false, code: "ORDER_NOT_OWNED" };
+      return { ok: false as const, code: "ORDER_NOT_OWNED" as const };
     }
 
     if (order.status !== "pending") {
-      return { ok: false, code: "ORDER_NOT_EDITABLE" };
+      return { ok: false as const, code: "ORDER_NOT_EDITABLE" as const };
     }
 
     const menuItem = this.menu.find((item) => item.id === input.itemId);
-    if (!menuItem) {
-      return { ok: false, code: "MENU_ITEM_NOT_FOUND" };
+    if (!menuItem || !menuItem.is_available) {
+      return { ok: false as const, code: "MENU_ITEM_NOT_FOUND" as const };
     }
 
     const existingOrderItemIndex = order.items.findIndex(
@@ -321,7 +401,7 @@ export class PgStore implements Store {
       } else {
         await db
           .update(orderItemsTable)
-          .set({ qty: input.qty })
+          .set({ qty: input.qty, note: input.note })
           .where(
             and(
               eq(orderItemsTable.orderId, orderId),
@@ -331,6 +411,7 @@ export class PgStore implements Store {
         const target = order.items[existingOrderItemIndex];
         if (target) {
           target.qty = input.qty;
+          target.note = input.note ?? target.note;
         }
       }
     } else if (input.qty > 0) {
@@ -343,13 +424,15 @@ export class PgStore implements Store {
         description: menuItem.description,
         imageUrl: menuItem.image_url,
         qty: input.qty,
+        note: input.note,
+        status: "queued",
       });
 
       order.items.push({
-        item: {
-          ...menuItem,
-        },
+        item: { ...menuItem },
         qty: input.qty,
+        note: input.note,
+        status: "queued",
       });
     }
 
@@ -360,38 +443,33 @@ export class PgStore implements Store {
       .set({ total: order.total })
       .where(eq(ordersTable.id, orderId));
 
-    return { ok: true, order };
+    return { ok: true as const, order };
   }
 
   async submitOrder(
     orderId: number,
-    input: { userId: number },
-  ): Promise<
-    | { ok: true; order: Order }
-    | {
-        ok: false;
-        code:
-          | "ORDER_NOT_FOUND"
-          | "ORDER_NOT_OWNED"
-          | "ORDER_NOT_EDITABLE"
-          | "EMPTY_ORDER";
-      }
-  > {
+    input: {
+      userId: string;
+      orderType?: OrderType;
+      packageType?: PackageType;
+      tableId?: number;
+    },
+  ) {
     const order = this.orders.find((targetOrder) => targetOrder.id === orderId);
     if (!order) {
-      return { ok: false, code: "ORDER_NOT_FOUND" };
+      return { ok: false as const, code: "ORDER_NOT_FOUND" as const };
     }
 
     if (order.userId !== input.userId) {
-      return { ok: false, code: "ORDER_NOT_OWNED" };
+      return { ok: false as const, code: "ORDER_NOT_OWNED" as const };
     }
 
     if (order.status !== "pending") {
-      return { ok: false, code: "ORDER_NOT_EDITABLE" };
+      return { ok: false as const, code: "ORDER_NOT_EDITABLE" as const };
     }
 
     if (order.items.length === 0) {
-      return { ok: false, code: "EMPTY_ORDER" };
+      return { ok: false as const, code: "EMPTY_ORDER" as const };
     }
 
     const submittedAt = new Date().toISOString();
@@ -406,8 +484,144 @@ export class PgStore implements Store {
 
     order.status = "submitted";
     order.submittedAt = submittedAt;
+    order.orderType = input.orderType ?? order.orderType;
+    order.packageType = input.packageType ?? order.packageType;
+    order.tableId = input.tableId ?? order.tableId;
+    order.estimatedReadyAt = estimateReadyAt(order, this.orders);
+    order.pickupCode = generatePickupCode(order.id);
 
-    return { ok: true, order };
+    return { ok: true as const, order };
+  }
+
+  async updateOrderStatus(orderId: number, status: OrderStatus) {
+    const order = this.orders.find((targetOrder) => targetOrder.id === orderId);
+    if (!order) {
+      return { ok: false as const, code: "ORDER_NOT_FOUND" as const };
+    }
+
+    await db
+      .update(ordersTable)
+      .set({ status })
+      .where(eq(ordersTable.id, orderId));
+
+    order.status = status;
+    if (status === "completed") {
+      order.completedAt = new Date().toISOString();
+    }
+    if (status === "cancelled") {
+      order.cancelledAt = new Date().toISOString();
+    }
+
+    return { ok: true as const, order };
+  }
+
+  async updateOrderItemStatus(
+    orderId: number,
+    input: { itemId: number; status: OrderItemStatus },
+  ) {
+    const order = this.orders.find((targetOrder) => targetOrder.id === orderId);
+    if (!order) {
+      return { ok: false as const, code: "ORDER_NOT_FOUND" as const };
+    }
+
+    const orderItem = order.items.find((item) => item.item.id === input.itemId);
+    if (!orderItem) {
+      return { ok: false as const, code: "ORDER_NOT_FOUND" as const };
+    }
+
+    await db
+      .update(orderItemsTable)
+      .set({ status: input.status })
+      .where(
+        and(
+          eq(orderItemsTable.orderId, orderId),
+          eq(orderItemsTable.itemId, input.itemId),
+        ),
+      );
+
+    orderItem.status = input.status;
+
+    if (
+      order.items.length > 0 &&
+      order.items.every((item) => item.status === "ready")
+    ) {
+      order.status = "ready";
+      await db
+        .update(ordersTable)
+        .set({ status: "ready" })
+        .where(eq(ordersTable.id, orderId));
+    }
+
+    return { ok: true as const, order };
+  }
+
+  async cancelOrder(orderId: number, input: { userId?: string }) {
+    const order = this.orders.find((targetOrder) => targetOrder.id === orderId);
+    if (!order) {
+      return { ok: false as const, code: "ORDER_NOT_FOUND" as const };
+    }
+    if (input.userId && order.userId !== input.userId) {
+      return { ok: false as const, code: "ORDER_NOT_OWNED" as const };
+    }
+    if (["completed", "cancelled"].includes(order.status)) {
+      return { ok: false as const, code: "ORDER_NOT_EDITABLE" as const };
+    }
+
+    await db
+      .update(ordersTable)
+      .set({ status: "cancelled" })
+      .where(eq(ordersTable.id, orderId));
+
+    order.status = "cancelled";
+    order.cancelledAt = new Date().toISOString();
+
+    return { ok: true as const, order };
+  }
+
+  async reorder(orderId: number, input: { userId: string }) {
+    const sourceOrder = this.orders.find(
+      (targetOrder) =>
+        targetOrder.id === orderId && targetOrder.userId === input.userId,
+    );
+    if (!sourceOrder) {
+      return { ok: false as const, code: "ORDER_NOT_FOUND" as const };
+    }
+
+    const newOrder = await this.createOrder({
+      userId: input.userId,
+      orderType: sourceOrder.orderType,
+      packageType: sourceOrder.packageType,
+    });
+
+    for (const item of sourceOrder.items) {
+      await this.updateOrderItem(newOrder.id, {
+        userId: input.userId,
+        itemId: item.item.id,
+        qty: item.qty,
+        note: item.note,
+      });
+    }
+
+    return { ok: true as const, order: newOrder };
+  }
+
+  async completePickup(pickupCode: string) {
+    const order = this.orders.find(
+      (targetOrder) => targetOrder.pickupCode === pickupCode,
+    );
+    if (!order) {
+      return { ok: false as const, code: "PICKUP_CODE_INVALID" as const };
+    }
+
+    await db
+      .update(ordersTable)
+      .set({ status: "completed" })
+      .where(eq(ordersTable.id, order.id));
+
+    order.status = "completed";
+    order.completedAt = new Date().toISOString();
+
+    return { ok: true as const, order };
   }
 
   private async seedFromJsonIfEmpty(): Promise<void> {
@@ -432,10 +646,11 @@ export class PgStore implements Store {
     if (normalized.users.length > 0) {
       await db.insert(usersTable).values(
         normalized.users.map((user) => ({
-          id: user.id,
-          email: user.email,
-          name: user.name,
-          password: user.password,
+          id: Number(user.id),
+          email: user.email ?? "",
+          name: user.name ?? "",
+          password: user.password ?? "",
+          role: user.role ?? "customer",
         })),
       );
     }
@@ -449,25 +664,28 @@ export class PgStore implements Store {
           category: item.category,
           description: item.description,
           imageUrl: item.image_url,
+          defaultTime: item.default_time ?? 5,
+          isAvailable: item.is_available ?? true,
         })),
       );
     }
 
     if (normalized.orders.length > 0) {
       for (const order of normalized.orders) {
+        const orderItems = Array.isArray(order.items) ? order.items : [];
         await db.insert(ordersTable).values({
           id: order.id,
-          userId: order.userId,
-          total: order.total,
-          status: order.status,
-          createdAt: new Date(order.createdAt),
+          userId: toUserId(order.userId),
+          total: order.total ?? 0,
+          status: normalizeStatus(order.status),
+          createdAt: new Date(order.createdAt ?? new Date().toISOString()),
           submittedAt: order.submittedAt ? new Date(order.submittedAt) : null,
         });
 
-        if (order.items.length > 0) {
+        if (orderItems.length > 0 && order.id) {
           await db.insert(orderItemsTable).values(
-            order.items.map((orderItem) => ({
-              orderId: order.id,
+            orderItems.map((orderItem) => ({
+              orderId: order.id!,
               itemId: orderItem.item.id,
               name: orderItem.item.name,
               price: orderItem.item.price,
@@ -475,6 +693,8 @@ export class PgStore implements Store {
               description: orderItem.item.description,
               imageUrl: orderItem.item.image_url,
               qty: orderItem.qty,
+              note: orderItem.note,
+              status: "queued",
             })),
           );
         }
@@ -514,10 +734,11 @@ export class PgStore implements Store {
       .orderBy(asc(orderItemsTable.id));
 
     this.users = userRows.map((row) => ({
-      id: row.id,
+      id: String(row.id),
       email: row.email,
       name: row.name,
       password: row.password,
+      role: (row.role as User["role"]) ?? "customer",
     }));
 
     this.menu = menuRows.map((row) => ({
@@ -527,6 +748,8 @@ export class PgStore implements Store {
       category: row.category,
       description: row.description,
       image_url: row.imageUrl,
+      default_time: row.defaultTime,
+      is_available: row.isAvailable,
     }));
 
     const itemsByOrderId = new Map<number, OrderItem[]>();
@@ -540,8 +763,12 @@ export class PgStore implements Store {
           category: row.category,
           description: row.description,
           image_url: row.imageUrl,
+          default_time: 5,
+          is_available: true,
         },
         qty: row.qty,
+        note: row.note ?? undefined,
+        status: (row.status as OrderItemStatus) || "queued",
       });
       itemsByOrderId.set(row.orderId, orderItems);
     }
@@ -551,7 +778,9 @@ export class PgStore implements Store {
       userId: row.userId,
       items: itemsByOrderId.get(row.id) ?? [],
       total: row.total,
-      status: row.status === "submitted" ? "submitted" : "pending",
+      status: normalizeStatus(row.status),
+      orderType: "takeout",
+      packageType: "together",
       createdAt:
         row.createdAt instanceof Date
           ? row.createdAt.toISOString()

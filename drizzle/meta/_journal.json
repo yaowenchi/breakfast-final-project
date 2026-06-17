@@ -8,6 +8,27 @@
       "when": 1776699381769,
       "tag": "0000_nervous_ronan",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1781712000000,
+      "tag": "0001_breakfast_auth_system",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1781712600000,
+      "tag": "0002_better_auth_verification",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1781713200000,
+      "tag": "0003_user_roles",
+      "breakpoints": true
     }
   ]
 }

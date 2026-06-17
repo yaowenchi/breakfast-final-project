@@ -1,0 +1,35 @@
+services:
+  - type: web
+    name: breakfast-ordering-system
+    runtime: bun
+    plan: free
+    buildCommand: bun install && bun run build
+    startCommand: bun run start:render
+    healthCheckPath: /health
+    envVars:
+      - key: STORE_DRIVER
+        value: postgres
+      - key: HOST
+        value: 0.0.0.0
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        sync: false
+      - key: DATABASE_URL_MIGRATION
+        sync: false
+      - key: BETTER_AUTH_URL
+        sync: false
+      - key: BETTER_AUTH_SECRET
+        generateValue: true
+      - key: BETTER_AUTH_TRUSTED_ORIGINS
+        sync: false
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: BOSS_EMAIL
+        sync: false
+      - key: BOSS_PASSWORD
+        sync: false
+      - key: BOSS_NAME
+        value: Boss

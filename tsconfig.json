@@ -45,6 +45,8 @@
     "dist",
     "frontend",
     "auto-dev",
-    "breakfast-app-template"
+    "breakfast-app-template",
+    "backend.v8.ts",
+    "backend_*.ts"
   ]
 }
