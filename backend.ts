@@ -1,6 +1,5 @@
 import { Elysia } from "elysia";
 import { openapi } from "@elysiajs/openapi";
-import { staticPlugin } from "@elysiajs/static";
 import toTaipeiDateTime from "./util.ts";
 import { createStore } from "./store/index.ts";
 import {
@@ -69,6 +68,70 @@ const port = parseInt(process.env.PORT || "3000", 10);
 const host = process.env.HOST || "0.0.0.0";
 const allowedOrigin = process.env.API_ALLOWED_ORIGIN || "*";
 const store = createStore({ dataFilePath: "./data/store.json" });
+
+const staticContentTypes: Record<string, string> = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".webp": "image/webp",
+  ".ico": "image/x-icon",
+  ".json": "application/json; charset=utf-8",
+};
+
+function contentTypeFor(pathname: string) {
+  const dotIndex = pathname.lastIndexOf(".");
+  if (dotIndex === -1) {
+    return "application/octet-stream";
+  }
+
+  return (
+    staticContentTypes[pathname.slice(dotIndex).toLowerCase()] ??
+    "application/octet-stream"
+  );
+}
+
+function normalizePublicPath(pathname: string) {
+  let decodedPathname: string;
+  try {
+    decodedPathname = decodeURIComponent(pathname);
+  } catch {
+    return null;
+  }
+
+  const normalizedPathname = decodedPathname.replaceAll("\\", "/");
+  if (normalizedPathname.includes("..")) {
+    return null;
+  }
+
+  if (normalizedPathname === "/" || normalizedPathname === "/index.html") {
+    return "/index.html";
+  }
+
+  return normalizedPathname;
+}
+
+async function servePublicFile(pathname: string) {
+  const publicPath = normalizePublicPath(pathname);
+  if (!publicPath) {
+    return Response.json({ error: "Invalid path" }, { status: 400 });
+  }
+
+  const file = Bun.file(`./public${publicPath}`);
+  if (await file.exists()) {
+    return new Response(file, {
+      headers: { "content-type": contentTypeFor(publicPath) },
+    });
+  }
+
+  const indexFile = Bun.file("./public/index.html");
+  return new Response(indexFile, {
+    headers: { "content-type": "text/html; charset=utf-8" },
+  });
+}
 
 const roleRank: Record<UserRole, number> = {
   customer: 0,
@@ -357,13 +420,6 @@ function setTableStatus(
 }
 
 const app = new Elysia();
-
-app.use(
-  staticPlugin({
-    assets: "public",
-    prefix: "",
-  }),
-);
 
 app.use(
   openapi({
@@ -1780,14 +1836,7 @@ app.get(
 app.get(
   "*",
   async ({ request }) => {
-    const pathname = new URL(request.url).pathname;
-    const staticFile = Bun.file(`./public${pathname}`);
-
-    if (pathname !== "/" && (await staticFile.exists())) {
-      return staticFile;
-    }
-
-    return Bun.file("./public/index.html");
+    return servePublicFile(new URL(request.url).pathname);
   },
   { detail: { hide: true } },
 );
