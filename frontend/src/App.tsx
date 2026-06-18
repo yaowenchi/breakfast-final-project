@@ -439,6 +439,16 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (!authError) return;
+
+    const timeoutId = window.setTimeout(() => {
+      setAuthError("");
+    }, 4500);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [authError]);
+
+  useEffect(() => {
     if (!user || user.role !== "customer") {
       setOrderHistory([]);
       return;
@@ -543,7 +553,7 @@ export default function App() {
         credentials: "include",
         body: JSON.stringify({
           provider: "google",
-          callbackURL: window.location.origin,
+          callbackURL: "/",
         }),
       });
 
