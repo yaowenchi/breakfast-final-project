@@ -734,7 +734,7 @@ app.patch(
 app.patch(
   "/api/menu/:id/availability",
   async ({ params, body, request, set }) => {
-    const user = await requireRole(request, set, "manager");
+    const user = await requireRole(request, set, "staff");
     if (isAuthError(user)) {
       return user as never;
     }
@@ -754,7 +754,7 @@ app.patch(
     body: updateMenuItemBodySchema.pick({ is_available: true }),
     detail: {
       tags: ["menu"],
-      summary: "Set menu item availability",
+      summary: "Set menu item availability for kitchen sold-out control",
     },
     response: {
       200: menuItemResponseSchema,

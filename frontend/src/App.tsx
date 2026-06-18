@@ -161,6 +161,12 @@ function createGuestUser(): SafeUser {
   };
 }
 
+function isGuestUser(user: SafeUser | null) {
+  return Boolean(
+    user && (user.id.startsWith("guest-") || user.email.endsWith("@guest.local")),
+  );
+}
+
 function canUseKds(user: SafeUser | null) {
   return user?.role === "staff" || user?.role === "manager";
 }
@@ -197,6 +203,8 @@ export default function App() {
   const [isClearingCart, setIsClearingCart] = useState(false);
   const [isSubmittingOrder, setIsSubmittingOrder] = useState(false);
   const [submittedOrder, setSubmittedOrder] = useState<Order | null>(null);
+  const [orderHistory, setOrderHistory] = useState<Order[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
   const [kdsOrders, setKdsOrders] = useState<Order[]>([]);
   const [kdsBatches, setKdsBatches] = useState<BatchSuggestion[]>([]);
   const [kdsLoading, setKdsLoading] = useState(false);
@@ -297,6 +305,19 @@ export default function App() {
     setOrderId(currentOrder.id);
     syncCartFromOrder(currentOrder);
     return currentOrder;
+  }
+
+  async function loadOrderHistory(targetUserId: string) {
+    setHistoryLoading(true);
+
+    try {
+      const history = await fetchApiData<Order[]>(
+        `/api/orders/history?userId=${encodeURIComponent(targetUserId)}`,
+      );
+      setOrderHistory(Array.isArray(history) ? history : []);
+    } finally {
+      setHistoryLoading(false);
+    }
   }
 
   async function loadKdsData() {
@@ -419,12 +440,23 @@ export default function App() {
 
   useEffect(() => {
     if (!user || user.role !== "customer") {
+      setOrderHistory([]);
       return;
     }
 
     void loadCurrentOrder(user.id).catch((refreshError) => {
       setActionError("購物車讀取失敗，請稍後再試。");
       console.error(refreshError);
+    });
+
+    if (isGuestUser(user)) {
+      setOrderHistory([]);
+      return;
+    }
+
+    void loadOrderHistory(user.id).catch((historyError) => {
+      setActionError("歷史訂單讀取失敗，請稍後再試。");
+      console.error(historyError);
     });
   }, [user]);
 
@@ -537,6 +569,7 @@ export default function App() {
     setUser(guestUser);
     setView("customer");
     setSubmittedOrder(null);
+    setOrderHistory([]);
     setAuthError("");
     setActionError("");
     window.localStorage.setItem(USER_STORAGE_KEY, JSON.stringify(guestUser));
@@ -554,6 +587,7 @@ export default function App() {
     setAuthError("");
     setActionError("");
     setSubmittedOrder(null);
+    setOrderHistory([]);
     resetCartState();
     setView("customer");
   }
@@ -631,6 +665,9 @@ export default function App() {
       });
 
       setSubmittedOrder(order);
+      if (!isGuestUser(user)) {
+        await loadOrderHistory(user.id);
+      }
       resetCartState();
       setIsCartOpen(false);
     } catch (submitError) {
@@ -638,6 +675,31 @@ export default function App() {
       console.error(submitError);
     } finally {
       setIsSubmittingOrder(false);
+    }
+  }
+
+  async function reorderFromHistory(sourceOrderId: number) {
+    if (!user) return;
+    const opId = `reorder-${sourceOrderId}`;
+    setOperationId(opId);
+    setActionError("");
+
+    try {
+      const order = await fetchApiData<Order>(
+        `/api/orders/${sourceOrderId}/reorder?userId=${encodeURIComponent(
+          user.id,
+        )}`,
+        { method: "POST" },
+      );
+      setOrderId(order.id);
+      syncCartFromOrder(order);
+      setSubmittedOrder(null);
+      setIsCartOpen(true);
+    } catch (reorderError) {
+      setActionError("再點一次失敗，請確認品項是否仍可販售。");
+      console.error(reorderError);
+    } finally {
+      setOperationId(null);
     }
   }
 
@@ -680,6 +742,26 @@ export default function App() {
     } catch (kdsError) {
       setActionError("更新品項狀態失敗，請稍後再試。");
       console.error(kdsError);
+    } finally {
+      setOperationId(null);
+    }
+  }
+
+  async function updateKitchenAvailability(item: MenuItem, isAvailable: boolean) {
+    const opId = `kds-menu-${item.id}`;
+    setOperationId(opId);
+    setActionError("");
+
+    try {
+      await fetchApiData<MenuItem>(`/api/menu/${item.id}/availability`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ is_available: isAvailable }),
+      });
+      await loadMenu();
+    } catch (menuError) {
+      setActionError("更新售完品項失敗，請確認廚房或 boss 權限。");
+      console.error(menuError);
     } finally {
       setOperationId(null);
     }
@@ -905,6 +987,106 @@ export default function App() {
     );
   }
 
+  function renderOrderHistory() {
+    if (!user || user.role !== "customer") return null;
+
+    if (isGuestUser(user)) {
+      return (
+        <section className="mb-6 card bg-base-100 shadow-md">
+          <div className="card-body">
+            <h2 className="card-title">歷史訂單</h2>
+            <p className="text-sm opacity-70">
+              目前是匿名點餐。使用會員或 Google 登入後，下次回來可查看之前訂過的菜單。
+            </p>
+          </div>
+        </section>
+      );
+    }
+
+    return (
+      <section className="mb-6 card bg-base-100 shadow-md">
+        <div className="card-body">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h2 className="card-title">歷史訂單</h2>
+              <p className="text-sm opacity-70">
+                {user.name} 登入中，可查看之前訂過的菜單。
+              </p>
+            </div>
+            <button
+              className="btn btn-sm btn-outline"
+              onClick={() => void loadOrderHistory(user.id)}
+              disabled={historyLoading}
+            >
+              {historyLoading ? "更新中..." : "重新整理"}
+            </button>
+          </div>
+
+          {historyLoading ? (
+            <div className="alert">
+              <span>讀取歷史訂單中...</span>
+            </div>
+          ) : orderHistory.length === 0 ? (
+            <div className="alert alert-info">
+              <span>目前沒有歷史訂單。</span>
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+              {orderHistory.slice(0, 6).map((order) => (
+                <article
+                  key={order.id}
+                  className="rounded-lg border border-base-300 p-3 bg-base-200"
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <p className="font-semibold">訂單 #{order.id}</p>
+                      <p className="text-xs opacity-70">
+                        {formatDateTime(order.createdAt)}
+                      </p>
+                    </div>
+                    <span className={`badge ${orderStatusClass(order.status)}`}>
+                      {orderStatusLabel[order.status]}
+                    </span>
+                  </div>
+                  <ul className="mt-3 space-y-1 text-sm">
+                    {order.items.map((detail) => (
+                      <li
+                        key={`${order.id}-${detail.item.id}`}
+                        className="flex justify-between gap-3"
+                      >
+                        <span>
+                          {detail.item.name} x {detail.qty}
+                        </span>
+                        <span>${detail.item.price * detail.qty}</span>
+                      </li>
+                    ))}
+                  </ul>
+                  <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
+                    <div className="text-sm">
+                      <span className="font-semibold">總額 ${order.total}</span>
+                      <span className="ml-3 opacity-70">
+                        取餐 {formatDateTime(order.estimatedReadyAt)}
+                      </span>
+                    </div>
+                    <button
+                      className="btn btn-xs btn-primary"
+                      onClick={() => void reorderFromHistory(order.id)}
+                      disabled={operationId === `reorder-${order.id}`}
+                    >
+                      {operationId === `reorder-${order.id}`
+                        ? "加入中..."
+                        : "再點一次"}
+                    </button>
+                  </div>
+                </article>
+              ))}
+            </div>
+          )}
+        </div>
+      </section>
+    );
+  }
+
   function renderCustomerView() {
     return (
       <>
@@ -917,6 +1099,46 @@ export default function App() {
                   不需要會員或 Google 登入，也可以先選餐送單。
                 </p>
               </div>
+              <div className="w-full md:w-80 space-y-2">
+                <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-1 gap-2">
+                  <input
+                    className="input input-bordered input-sm"
+                    placeholder="Email"
+                    autoComplete="username"
+                    value={emailInput}
+                    onChange={(event) => setEmailInput(event.target.value)}
+                  />
+                  <input
+                    type="password"
+                    className="input input-bordered input-sm"
+                    placeholder="密碼"
+                    autoComplete="current-password"
+                    value={passwordInput}
+                    onChange={(event) => setPasswordInput(event.target.value)}
+                  />
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    className="btn btn-sm btn-outline"
+                    onClick={() => void handleLogin()}
+                    disabled={isLoggingIn || isGoogleSigningIn}
+                  >
+                    {isLoggingIn ? "登入中..." : "會員登入"}
+                  </button>
+                  <button
+                    className="btn btn-sm btn-outline"
+                    onClick={() => void handleGoogleSignIn()}
+                    disabled={isLoggingIn || isGoogleSigningIn}
+                  >
+                    {isGoogleSigningIn ? "Google..." : "Google 登入"}
+                  </button>
+                </div>
+                {authError ? (
+                  <div className="alert alert-error py-2 text-sm">
+                    <span>{authError}</span>
+                  </div>
+                ) : null}
+              </div>
               <button className="btn btn-primary" onClick={handleGuestOrder}>
                 開始點餐
               </button>
@@ -925,6 +1147,7 @@ export default function App() {
         ) : null}
 
         {renderSubmittedOrder()}
+        {renderOrderHistory()}
 
         {items.length === 0 ? (
           <div className="alert alert-info">
@@ -997,6 +1220,50 @@ export default function App() {
     );
   }
 
+  function renderKdsAvailabilityControls() {
+    return (
+      <section className="card bg-base-100 shadow-md border border-base-300">
+        <div className="card-body">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h3 className="card-title">售完品項</h3>
+              <p className="text-sm opacity-70">
+                廚房可即時標記售完，顧客菜單會立刻停用該品項。
+              </p>
+            </div>
+            <span className="badge badge-neutral">
+              {items.filter((item) => !item.is_available).length} 項售完
+            </span>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-2">
+            {items.map((item) => (
+              <div
+                key={item.id}
+                className="rounded-lg bg-base-200 p-3 flex items-center justify-between gap-3"
+              >
+                <div className="min-w-0">
+                  <p className="font-semibold truncate">{item.name}</p>
+                  <p className="text-xs opacity-70">{item.category}</p>
+                </div>
+                <button
+                  className={`btn btn-xs ${
+                    item.is_available ? "btn-outline" : "btn-warning"
+                  }`}
+                  onClick={() =>
+                    void updateKitchenAvailability(item, !item.is_available)
+                  }
+                  disabled={operationId === `kds-menu-${item.id}`}
+                >
+                  {item.is_available ? "設為售完" : "恢復販售"}
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      </section>
+    );
+  }
+
   function renderKdsView() {
     if (!canUseKds(user)) return renderLoginPanel("kds");
 
@@ -1017,6 +1284,8 @@ export default function App() {
             {kdsLoading ? "更新中..." : "重新整理"}
           </button>
         </div>
+
+        {renderKdsAvailabilityControls()}
 
         {kdsLoading ? (
           <div className="alert">
