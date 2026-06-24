@@ -309,6 +309,38 @@ export class JsonFileStore implements Store {
     };
   }
 
+  async register(input: {
+    email: string;
+    name: string;
+    password: string;
+    phone?: string;
+  }): Promise<
+    | { ok: true; user: Omit<User, "password"> }
+    | { ok: false; code: "EMAIL_EXISTS" }
+  > {
+    const email = input.email.trim().toLowerCase();
+    const existingUser = this.users.find(
+      (user) => user.email.trim().toLowerCase() === email,
+    );
+    if (existingUser) {
+      return { ok: false, code: "EMAIL_EXISTS" };
+    }
+
+    const newUser: User = {
+      id: String(++this.userIdCounter),
+      email,
+      name: input.name.trim(),
+      password: input.password,
+      phone: input.phone,
+      role: "customer",
+    };
+
+    this.users.push(newUser);
+    await this.persist();
+
+    return { ok: true, user: stripSensitiveUserData(newUser) };
+  }
+
   getUserById(userId: string): Omit<User, "password"> | undefined {
     const user = this.users.find((targetUser) => targetUser.id === userId);
     return user ? stripSensitiveUserData(user) : undefined;

@@ -8,6 +8,10 @@ import type {
   Order,
   OrderItemStatus,
   OrderStatus,
+  OrderType,
+  PackageType,
+  PickupVerification,
+  ProductIngredient,
   User,
   UserRole,
 } from "../../shared/contracts.ts";
@@ -17,6 +21,8 @@ const USER_STORAGE_KEY = "breakfast.user";
 
 type SafeUser = Omit<User, "password">;
 type AppView = "customer" | "kds" | "admin";
+const customerMenuTabs = ["餐點", "飲料"] as const;
+type CustomerMenuTab = (typeof customerMenuTabs)[number];
 
 interface CartDetail {
   itemId: number;
@@ -34,6 +40,14 @@ interface BatchSuggestion {
   productNames: string[];
 }
 
+interface KdsQueueItem {
+  priority: number;
+  orderId: number;
+  status: OrderStatus;
+  estimatedReadyAt?: string;
+  itemCount: number;
+}
+
 interface RevenueReport {
   orderCount: number;
   revenue: number;
@@ -41,7 +55,7 @@ interface RevenueReport {
   byStatus: Partial<Record<OrderStatus, number>>;
 }
 
-interface PopularItem {
+interface PopularReportItem {
   itemId: number;
   name: string;
   qty: number;
@@ -61,6 +75,40 @@ interface PeakHour {
   orderCount: number;
 }
 
+interface HealthStatus {
+  status: string;
+  auth?: {
+    betterAuthConfigured: boolean;
+    googleConfigured: boolean;
+  };
+}
+
+interface PickupQrPayload {
+  orderId: number;
+  pickupCode?: string;
+}
+
+interface OrderTracking {
+  orderId: number;
+  status: OrderStatus;
+  itemStatuses: Array<{
+    itemId: number;
+    name: string;
+    status: OrderItemStatus;
+  }>;
+  estimatedReadyAt?: string;
+  pickupCode?: string;
+}
+
+interface OrderEstimate {
+  queueMinutes: number;
+  cookingMinutes: number;
+  packagingMinutes: number;
+  batchSavingMinutes: number;
+  totalMinutes: number;
+  estimatedReadyAt: string;
+}
+
 interface MenuFormState {
   name: string;
   price: string;
@@ -69,6 +117,25 @@ interface MenuFormState {
   image_url: string;
   default_time: string;
   is_available: boolean;
+}
+
+interface IngredientFormState {
+  name: string;
+  stock: string;
+  unit: string;
+  reorderLevel: string;
+}
+
+interface TableFormState {
+  code: string;
+  capacity: string;
+  status: DiningTable["status"];
+  currentOrderId: string;
+}
+
+interface RecipeRow {
+  ingredientId: string;
+  quantity: string;
 }
 
 const emptyMenuForm: MenuFormState = {
@@ -81,11 +148,25 @@ const emptyMenuForm: MenuFormState = {
   is_available: true,
 };
 
+const emptyIngredientForm: IngredientFormState = {
+  name: "",
+  stock: "",
+  unit: "",
+  reorderLevel: "",
+};
+
+const emptyTableForm: TableFormState = {
+  code: "",
+  capacity: "",
+  status: "available",
+  currentOrderId: "",
+};
+
 const orderStatusLabel: Record<OrderStatus, string> = {
-  pending: "購物中",
+  pending: "購物車",
   submitted: "已送單",
   preparing: "製作中",
-  ready: "待取餐",
+  ready: "可取餐",
   completed: "已完成",
   cancelled: "已取消",
 };
@@ -93,17 +174,27 @@ const orderStatusLabel: Record<OrderStatus, string> = {
 const orderItemStatusLabel: Record<OrderItemStatus, string> = {
   queued: "排隊中",
   preparing: "製作中",
-  ready: "已完成",
+  ready: "完成",
   served: "已出餐",
   cancelled: "已取消",
 };
 
 const tableStatusLabel: Record<DiningTable["status"], string> = {
-  available: "空桌",
-  reserved: "已預約",
-  seated: "入座",
+  available: "可用",
+  reserved: "已預訂",
+  seated: "已入座",
   dining: "用餐中",
   cleaning: "待清潔",
+};
+
+const orderTypeLabel: Record<OrderType, string> = {
+  takeout: "外帶",
+  dine_in: "內用",
+};
+
+const packageTypeLabel: Record<PackageType, string> = {
+  together: "集中包裝",
+  separate: "分開包裝",
 };
 
 function buildApiUrl(path: string) {
@@ -117,7 +208,14 @@ async function fetchApiData<T>(path: string, init?: RequestInit): Promise<T> {
   });
 
   if (!response.ok) {
-    throw new Error(`${path} failed: HTTP ${response.status}`);
+    let message = `${path} failed: HTTP ${response.status}`;
+    try {
+      const payload = (await response.json()) as { error?: string; message?: string };
+      message = payload.error || payload.message || message;
+    } catch {
+      // Keep the HTTP error when the response is not JSON.
+    }
+    throw new Error(message);
   }
 
   const payload = (await response.json()) as ApiDataResponse<T>;
@@ -181,54 +279,92 @@ function defaultViewForRole(role: UserRole): AppView {
   return "customer";
 }
 
+function customerMenuTabForItem(item: MenuItem): CustomerMenuTab {
+  return item.category.includes("飲") ? "飲料" : "餐點";
+}
+
 export default function App() {
   const [view, setView] = useState<AppView>("customer");
   const [user, setUser] = useState<SafeUser | null>(null);
+  const [nameInput, setNameInput] = useState("");
   const [emailInput, setEmailInput] = useState("");
   const [passwordInput, setPasswordInput] = useState("");
   const [authError, setAuthError] = useState("");
   const [isLoggingIn, setIsLoggingIn] = useState(false);
+  const [isRegistering, setIsRegistering] = useState(false);
   const [isGoogleSigningIn, setIsGoogleSigningIn] = useState(false);
+
   const [items, setItems] = useState<MenuItem[]>([]);
+  const [selectedCustomerMenuTab, setSelectedCustomerMenuTab] =
+    useState<CustomerMenuTab>("餐點");
+  const [selectedMenuDetail, setSelectedMenuDetail] = useState<MenuItem | null>(null);
+
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
-  const [orderId, setOrderId] = useState<number | null>(null);
-  const [cartQtyByItemId, setCartQtyByItemId] = useState<Record<number, number>>(
-    {},
-  );
-  const [cartTotal, setCartTotal] = useState(0);
-  const [activeItemId, setActiveItemId] = useState<number | null>(null);
   const [actionError, setActionError] = useState("");
+  const [operationId, setOperationId] = useState<string | null>(null);
+
+  const [orderId, setOrderId] = useState<number | null>(null);
+  const [cartQtyByItemId, setCartQtyByItemId] = useState<Record<number, number>>({});
+  const [cartTotal, setCartTotal] = useState(0);
+  const [orderType, setOrderType] = useState<OrderType>("takeout");
+  const [packageType, setPackageType] = useState<PackageType>("together");
+  const [selectedTableId, setSelectedTableId] = useState<number | null>(null);
+  const [availableTables, setAvailableTables] = useState<DiningTable[]>([]);
+  const [tablesLoading, setTablesLoading] = useState(false);
+  const [activeItemId, setActiveItemId] = useState<number | null>(null);
   const [isCartOpen, setIsCartOpen] = useState(false);
   const [isClearingCart, setIsClearingCart] = useState(false);
   const [isSubmittingOrder, setIsSubmittingOrder] = useState(false);
   const [submittedOrder, setSubmittedOrder] = useState<Order | null>(null);
   const [orderHistory, setOrderHistory] = useState<Order[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
+  const [customerOrderDetail, setCustomerOrderDetail] = useState<Order | null>(null);
+  const [trackingResult, setTrackingResult] = useState<OrderTracking | null>(null);
+  const [estimateResult, setEstimateResult] = useState<OrderEstimate | null>(null);
+  const [pickupQr, setPickupQr] = useState<PickupQrPayload | null>(null);
+
   const [kdsOrders, setKdsOrders] = useState<Order[]>([]);
   const [kdsBatches, setKdsBatches] = useState<BatchSuggestion[]>([]);
+  const [kdsQueue, setKdsQueue] = useState<KdsQueueItem[]>([]);
   const [kdsLoading, setKdsLoading] = useState(false);
+  const [pickupCodeInput, setPickupCodeInput] = useState("");
+  const [pickupVerification, setPickupVerification] =
+    useState<PickupVerification | null>(null);
+
   const [adminLoading, setAdminLoading] = useState(false);
+  const [health, setHealth] = useState<HealthStatus | null>(null);
   const [revenueReport, setRevenueReport] = useState<RevenueReport | null>(null);
-  const [popularItems, setPopularItems] = useState<PopularItem[]>([]);
-  const [turnoverReport, setTurnoverReport] = useState<TurnoverReport | null>(
-    null,
-  );
+  const [popularItems, setPopularItems] = useState<PopularReportItem[]>([]);
+  const [turnoverReport, setTurnoverReport] = useState<TurnoverReport | null>(null);
   const [peakHours, setPeakHours] = useState<PeakHour[]>([]);
   const [tables, setTables] = useState<DiningTable[]>([]);
   const [ingredients, setIngredients] = useState<Ingredient[]>([]);
-  const [lowStockIngredients, setLowStockIngredients] = useState<Ingredient[]>(
-    [],
-  );
-  const [operationId, setOperationId] = useState<string | null>(null);
+  const [lowStockIngredients, setLowStockIngredients] = useState<Ingredient[]>([]);
+  const [allOrders, setAllOrders] = useState<Order[]>([]);
+  const [adminOrderDetail, setAdminOrderDetail] = useState<Order | null>(null);
+
   const [menuForm, setMenuForm] = useState<MenuFormState>(emptyMenuForm);
   const [editingMenuId, setEditingMenuId] = useState<number | null>(null);
   const [isSavingMenu, setIsSavingMenu] = useState(false);
 
+  const [ingredientForm, setIngredientForm] =
+    useState<IngredientFormState>(emptyIngredientForm);
+  const [editingIngredientId, setEditingIngredientId] = useState<number | null>(null);
+
+  const [tableForm, setTableForm] = useState<TableFormState>(emptyTableForm);
+  const [editingTableId, setEditingTableId] = useState<number | null>(null);
+
+  const [recipeMenuItem, setRecipeMenuItem] = useState<MenuItem | null>(null);
+  const [recipeRows, setRecipeRows] = useState<RecipeRow[]>([]);
+  const [productIngredients, setProductIngredients] = useState<ProductIngredient[]>(
+    [],
+  );
+
   const grouped = useMemo(() => {
     const groupedItems = items.reduce(
       (acc, item) => {
-        const category = item.category || "其他";
+        const category = item.category || "未分類";
         acc[category] ??= [];
         acc[category].push(item);
         return acc;
@@ -243,6 +379,28 @@ export default function App() {
       ),
     };
   }, [items]);
+
+  const customerMenuItems = useMemo(
+    () =>
+      items.filter(
+        (item) => customerMenuTabForItem(item) === selectedCustomerMenuTab,
+      ),
+    [items, selectedCustomerMenuTab],
+  );
+
+  const customerMenuCounts = useMemo(
+    () =>
+      customerMenuTabs.reduce(
+        (counts, tab) => {
+          counts[tab] = items.filter(
+            (item) => customerMenuTabForItem(item) === tab,
+          ).length;
+          return counts;
+        },
+        { 餐點: 0, 飲料: 0 } as Record<CustomerMenuTab, number>,
+      ),
+    [items],
+  );
 
   const cartItemCount = useMemo(
     () => Object.values(cartQtyByItemId).reduce((sum, qty) => sum + qty, 0),
@@ -268,6 +426,17 @@ export default function App() {
       .filter((entry): entry is CartDetail => entry !== null);
   }, [cartQtyByItemId, items]);
 
+  const lastCompletedOrder = useMemo(() => {
+    if (!user || isGuestUser(user) || orderHistory.length === 0) return null;
+    return orderHistory[0];
+  }, [orderHistory, user]);
+
+  function pathWithUserId(path: string, targetUserId = user?.id) {
+    if (!targetUserId) return path;
+    const separator = path.includes("?") ? "&" : "?";
+    return `${path}${separator}userId=${encodeURIComponent(targetUserId)}`;
+  }
+
   function syncCartFromOrder(order: Order) {
     setCartQtyByItemId(
       order.items.reduce(
@@ -287,9 +456,48 @@ export default function App() {
     setCartTotal(0);
   }
 
+  function buildOrderOptions() {
+    return {
+      orderType,
+      packageType,
+      tableId: orderType === "dine_in" ? selectedTableId : null,
+    };
+  }
+
+  function validateOrderOptions() {
+    if (orderType === "dine_in" && !selectedTableId) {
+      setActionError("請先選擇內用桌位，再繼續點餐。");
+      return false;
+    }
+
+    return true;
+  }
+
   async function loadMenu() {
     const fetchedItems = await fetchApiData<MenuItem[]>("/api/menu");
     setItems(Array.isArray(fetchedItems) ? fetchedItems : []);
+  }
+
+  async function loadMenuDetail(menuId: number) {
+    const item = await fetchApiData<MenuItem>(`/api/menu/${menuId}`);
+    setSelectedMenuDetail(item);
+  }
+
+  async function loadAvailableTables() {
+    setTablesLoading(true);
+
+    try {
+      const tableList = await fetchApiData<DiningTable[]>("/api/tables/available");
+      const nextTables = Array.isArray(tableList) ? tableList : [];
+      setAvailableTables(nextTables);
+      setSelectedTableId((currentTableId) =>
+        currentTableId && nextTables.some((table) => table.id === currentTableId)
+          ? currentTableId
+          : null,
+      );
+    } finally {
+      setTablesLoading(false);
+    }
   }
 
   async function loadCurrentOrder(targetUserId: string): Promise<Order | null> {
@@ -303,6 +511,9 @@ export default function App() {
     }
 
     setOrderId(currentOrder.id);
+    setOrderType(currentOrder.orderType ?? "takeout");
+    setPackageType(currentOrder.packageType ?? "together");
+    setSelectedTableId(currentOrder.tableId ?? null);
     syncCartFromOrder(currentOrder);
     return currentOrder;
   }
@@ -325,12 +536,14 @@ export default function App() {
     setActionError("");
 
     try {
-      const [orders, batches] = await Promise.all([
+      const [orders, batches, queue] = await Promise.all([
         fetchApiData<Order[]>("/api/kds/orders"),
         fetchApiData<BatchSuggestion[]>("/api/kds/batches"),
+        fetchApiData<KdsQueueItem[]>("/api/kds/queue"),
       ]);
       setKdsOrders(Array.isArray(orders) ? orders : []);
       setKdsBatches(Array.isArray(batches) ? batches : []);
+      setKdsQueue(Array.isArray(queue) ? queue : []);
     } catch (kdsError) {
       setActionError("廚房資料讀取失敗，請確認帳號權限或後端 API。");
       console.error(kdsError);
@@ -344,17 +557,29 @@ export default function App() {
     setActionError("");
 
     try {
-      const [revenue, popular, turnover, peaks, tableList, ingredientList, lowStock] =
-        await Promise.all([
-          fetchApiData<RevenueReport>("/api/reports/revenue"),
-          fetchApiData<PopularItem[]>("/api/reports/popular-items"),
-          fetchApiData<TurnoverReport>("/api/reports/turnover"),
-          fetchApiData<PeakHour[]>("/api/reports/peak-hours"),
-          fetchApiData<DiningTable[]>("/api/tables"),
-          fetchApiData<Ingredient[]>("/api/ingredients"),
-          fetchApiData<Ingredient[]>("/api/ingredients/low-stock"),
-        ]);
+      const [
+        healthStatus,
+        revenue,
+        popular,
+        turnover,
+        peaks,
+        tableList,
+        ingredientList,
+        lowStock,
+        orders,
+      ] = await Promise.all([
+        fetchApiData<HealthStatus>("/health"),
+        fetchApiData<RevenueReport>("/api/reports/revenue"),
+        fetchApiData<PopularReportItem[]>("/api/reports/popular-items"),
+        fetchApiData<TurnoverReport>("/api/reports/turnover"),
+        fetchApiData<PeakHour[]>("/api/reports/peak-hours"),
+        fetchApiData<DiningTable[]>("/api/tables"),
+        fetchApiData<Ingredient[]>("/api/ingredients"),
+        fetchApiData<Ingredient[]>("/api/ingredients/low-stock"),
+        fetchApiData<Order[]>("/api/orders"),
+      ]);
 
+      setHealth(healthStatus);
       setRevenueReport(revenue);
       setPopularItems(Array.isArray(popular) ? popular : []);
       setTurnoverReport(turnover);
@@ -362,8 +587,9 @@ export default function App() {
       setTables(Array.isArray(tableList) ? tableList : []);
       setIngredients(Array.isArray(ingredientList) ? ingredientList : []);
       setLowStockIngredients(Array.isArray(lowStock) ? lowStock : []);
+      setAllOrders(Array.isArray(orders) ? orders : []);
     } catch (adminError) {
-      setActionError("後台資料讀取失敗，請確認是否使用 boss 帳號登入。");
+      setActionError("後台資料讀取失敗，請確認 boss 帳號權限或後端 API。");
       console.error(adminError);
     } finally {
       setAdminLoading(false);
@@ -383,12 +609,19 @@ export default function App() {
           parsedUser.name &&
           parsedUser.role
         ) {
-          setUser({
-            id: parsedUser.id,
-            email: parsedUser.email,
-            name: parsedUser.name,
-            role: parsedUser.role,
-          });
+          if (
+            parsedUser.id.startsWith("guest-") ||
+            parsedUser.email.endsWith("@guest.local")
+          ) {
+            window.localStorage.removeItem(USER_STORAGE_KEY);
+          } else {
+            setUser({
+              id: parsedUser.id,
+              email: parsedUser.email,
+              name: parsedUser.name,
+              role: parsedUser.role,
+            });
+          }
         }
       } catch {
         window.localStorage.removeItem(USER_STORAGE_KEY);
@@ -408,15 +641,10 @@ export default function App() {
       }
 
       try {
-        const sessionUser = await fetchApiData<SafeUser | null>(
-          "/api/auth/session",
-        );
+        const sessionUser = await fetchApiData<SafeUser | null>("/api/auth/session");
         if (mounted && sessionUser) {
           setUser(sessionUser);
-          window.localStorage.setItem(
-            USER_STORAGE_KEY,
-            JSON.stringify(sessionUser),
-          );
+          window.localStorage.setItem(USER_STORAGE_KEY, JSON.stringify(sessionUser));
           setView((currentView) => {
             if (currentView === "admin" && !canUseAdmin(sessionUser)) {
               return defaultViewForRole(sessionUser.role);
@@ -449,13 +677,25 @@ export default function App() {
   }, [authError]);
 
   useEffect(() => {
+    if (orderType === "dine_in") {
+      void loadAvailableTables().catch((tableError) => {
+        setActionError("空桌資料讀取失敗，請稍後再試。");
+        console.error(tableError);
+      });
+      return;
+    }
+
+    setSelectedTableId(null);
+  }, [orderType]);
+
+  useEffect(() => {
     if (!user || user.role !== "customer") {
       setOrderHistory([]);
       return;
     }
 
     void loadCurrentOrder(user.id).catch((refreshError) => {
-      setActionError("購物車讀取失敗，請稍後再試。");
+      setActionError("購物車讀取失敗，請重新整理。");
       console.error(refreshError);
     });
 
@@ -465,7 +705,7 @@ export default function App() {
     }
 
     void loadOrderHistory(user.id).catch((historyError) => {
-      setActionError("歷史訂單讀取失敗，請稍後再試。");
+      setActionError("歷史訂單讀取失敗，請重新整理。");
       console.error(historyError);
     });
   }, [user]);
@@ -481,16 +721,40 @@ export default function App() {
 
   async function ensureOrder(): Promise<number> {
     if (!user) throw new Error("Please start a customer session first");
+    if (!validateOrderOptions()) throw new Error("Order options are incomplete");
     if (orderId !== null) return orderId;
 
+    const options = buildOrderOptions();
     const createdOrder = await fetchApiData<Order>("/api/orders", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ userId: user.id }),
+      body: JSON.stringify({
+        userId: user.id,
+        orderType: options.orderType,
+        packageType: options.packageType,
+        tableId: options.tableId ?? undefined,
+      }),
     });
 
     setOrderId(createdOrder.id);
     return createdOrder.id;
+  }
+
+  async function syncOrderOptions(targetOrderId: number) {
+    if (!user) throw new Error("Please start a customer session first");
+    if (!validateOrderOptions()) throw new Error("Order options are incomplete");
+
+    const options = buildOrderOptions();
+    await fetchApiData<Order>(`/api/orders/${targetOrderId}/options`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        userId: user.id,
+        orderType: options.orderType,
+        packageType: options.packageType,
+        tableId: options.tableId,
+      }),
+    });
   }
 
   async function handleLogin() {
@@ -509,21 +773,19 @@ export default function App() {
       });
 
       setUser(loggedInUser);
-      window.localStorage.setItem(
-        USER_STORAGE_KEY,
-        JSON.stringify(loggedInUser),
-      );
+      window.localStorage.setItem(USER_STORAGE_KEY, JSON.stringify(loggedInUser));
+      setNameInput("");
       setEmailInput("");
       setPasswordInput("");
 
       if (view === "admin" && loggedInUser.role !== "manager") {
-        setAuthError("此帳號沒有後台權限。");
+        setAuthError("這個帳號沒有後台權限。");
         setView(defaultViewForRole(loggedInUser.role));
         return;
       }
 
       if (view === "kds" && !canUseKds(loggedInUser)) {
-        setAuthError("此帳號沒有廚房權限。");
+        setAuthError("這個帳號沒有 KDS 權限。");
         setView(defaultViewForRole(loggedInUser.role));
         return;
       }
@@ -534,10 +796,48 @@ export default function App() {
           : currentView,
       );
     } catch (loginError) {
-      setAuthError("登入失敗，請確認帳號或密碼。");
+      setAuthError("登入失敗，請確認帳號密碼。");
       console.error(loginError);
     } finally {
       setIsLoggingIn(false);
+    }
+  }
+
+  async function handleRegister() {
+    const name = nameInput.trim();
+    const email = emailInput.trim();
+
+    if (!name || !email || !passwordInput) {
+      setAuthError("註冊需要姓名、Email 和密碼。");
+      return;
+    }
+
+    setAuthError("");
+    setActionError("");
+    setIsRegistering(true);
+
+    try {
+      const registeredUser = await fetchApiData<SafeUser>("/api/auth/register", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name,
+          email,
+          password: passwordInput,
+        }),
+      });
+
+      setUser(registeredUser);
+      window.localStorage.setItem(USER_STORAGE_KEY, JSON.stringify(registeredUser));
+      setNameInput("");
+      setEmailInput("");
+      setPasswordInput("");
+      setView("customer");
+    } catch (registerError) {
+      setAuthError("註冊失敗，Email 可能已被使用。");
+      console.error(registerError);
+    } finally {
+      setIsRegistering(false);
     }
   }
 
@@ -580,12 +880,31 @@ export default function App() {
     setView("customer");
     setSubmittedOrder(null);
     setOrderHistory([]);
+    resetCartState();
+    setOrderType("takeout");
+    setPackageType("together");
+    setSelectedTableId(null);
     setAuthError("");
     setActionError("");
-    window.localStorage.setItem(USER_STORAGE_KEY, JSON.stringify(guestUser));
   }
 
   function handleLogout() {
+    const currentUser = user;
+    const currentOrderId = orderId;
+
+    if (currentUser && isGuestUser(currentUser) && currentOrderId !== null) {
+      void fetch(
+        buildApiUrl(
+          `/api/orders/${currentOrderId}/cancel?userId=${encodeURIComponent(
+            currentUser.id,
+          )}`,
+        ),
+        { method: "POST", credentials: "include" },
+      ).catch((cancelError) => {
+        console.error(cancelError);
+      });
+    }
+
     void fetch(buildApiUrl("/api/auth/sign-out"), {
       method: "POST",
       credentials: "include",
@@ -598,7 +917,14 @@ export default function App() {
     setActionError("");
     setSubmittedOrder(null);
     setOrderHistory([]);
+    setCustomerOrderDetail(null);
+    setTrackingResult(null);
+    setEstimateResult(null);
+    setPickupQr(null);
     resetCartState();
+    setOrderType("takeout");
+    setPackageType("together");
+    setSelectedTableId(null);
     setView("customer");
   }
 
@@ -608,7 +934,11 @@ export default function App() {
 
     try {
       if (!user) {
-        setActionError("請先按直接點餐，再加入購物車。");
+        setActionError("請先登入或使用訪客點餐。");
+        return;
+      }
+
+      if (!validateOrderOptions()) {
         return;
       }
 
@@ -664,21 +994,38 @@ export default function App() {
 
   async function submitOrder() {
     if (!user || orderId === null || cartDetails.length === 0) return;
+    if (!validateOrderOptions()) return;
     setActionError("");
     setIsSubmittingOrder(true);
 
     try {
+      await syncOrderOptions(orderId);
+      const options = buildOrderOptions();
       const order = await fetchApiData<Order>(`/api/orders/${orderId}/submit`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ userId: user.id }),
+        body: JSON.stringify({
+          userId: user.id,
+          orderType: options.orderType,
+          packageType: options.packageType,
+          tableId: options.tableId ?? undefined,
+        }),
       });
 
       setSubmittedOrder(order);
+      setTrackingResult(null);
+      setEstimateResult(null);
+      setPickupQr(null);
       if (!isGuestUser(user)) {
         await loadOrderHistory(user.id);
       }
       resetCartState();
+      setSelectedTableId(null);
+      if (orderType === "dine_in") {
+        void loadAvailableTables().catch((tableError) => {
+          console.error(tableError);
+        });
+      }
       setIsCartOpen(false);
     } catch (submitError) {
       setActionError("送出訂單失敗，請稍後再試。");
@@ -702,6 +1049,9 @@ export default function App() {
         { method: "POST" },
       );
       setOrderId(order.id);
+      setOrderType(order.orderType ?? "takeout");
+      setPackageType(order.packageType ?? "together");
+      setSelectedTableId(order.tableId ?? null);
       syncCartFromOrder(order);
       setSubmittedOrder(null);
       setIsCartOpen(true);
@@ -710,6 +1060,61 @@ export default function App() {
       console.error(reorderError);
     } finally {
       setOperationId(null);
+    }
+  }
+
+  async function loadCustomerOrderDetail(targetOrderId: number) {
+    if (!user) return;
+    setActionError("");
+    try {
+      const order = await fetchApiData<Order>(
+        pathWithUserId(`/api/orders/${targetOrderId}`),
+      );
+      setCustomerOrderDetail(order);
+    } catch (detailError) {
+      setActionError("訂單詳情讀取失敗。");
+      console.error(detailError);
+    }
+  }
+
+  async function loadTracking(targetOrderId: number) {
+    if (!user) return;
+    setActionError("");
+    try {
+      const tracking = await fetchApiData<OrderTracking>(
+        pathWithUserId(`/api/orders/${targetOrderId}/tracking`),
+      );
+      setTrackingResult(tracking);
+    } catch (trackingError) {
+      setActionError("訂單追蹤讀取失敗。");
+      console.error(trackingError);
+    }
+  }
+
+  async function loadEstimate(targetOrderId: number) {
+    if (!user) return;
+    setActionError("");
+    try {
+      const estimate = await fetchApiData<OrderEstimate>(
+        pathWithUserId(`/api/orders/${targetOrderId}/estimate`),
+      );
+      setEstimateResult(estimate);
+    } catch (estimateError) {
+      setActionError("預估時間讀取失敗。");
+      console.error(estimateError);
+    }
+  }
+
+  async function loadPickupQr(targetOrderId: number) {
+    setActionError("");
+    try {
+      const qr = await fetchApiData<PickupQrPayload>(
+        `/api/pickup/${targetOrderId}/qrcode`,
+      );
+      setPickupQr(qr);
+    } catch (qrError) {
+      setActionError("取餐碼讀取失敗。");
+      console.error(qrError);
     }
   }
 
@@ -777,6 +1182,33 @@ export default function App() {
     }
   }
 
+  async function verifyPickup() {
+    const pickupCode = pickupCodeInput.trim();
+    if (!pickupCode) {
+      setActionError("請輸入取餐碼。");
+      return;
+    }
+
+    setOperationId("pickup-verify");
+    setActionError("");
+
+    try {
+      const verified = await fetchApiData<PickupVerification>("/api/pickup/verify", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ pickupCode }),
+      });
+      setPickupVerification(verified);
+      setPickupCodeInput("");
+      await loadKdsData();
+    } catch (pickupError) {
+      setActionError("取餐驗證失敗，請確認取餐碼。");
+      console.error(pickupError);
+    } finally {
+      setOperationId(null);
+    }
+  }
+
   async function updateTableStatus(
     tableId: number,
     action: "seat" | "leave" | "clean",
@@ -795,8 +1227,9 @@ export default function App() {
           table.id === updatedTable.id ? updatedTable : table,
         ),
       );
+      if (orderType === "dine_in") await loadAvailableTables();
     } catch (tableError) {
-      setActionError("更新桌位失敗，請稍後再試。");
+      setActionError("更新桌位狀態失敗，請稍後再試。");
       console.error(tableError);
     } finally {
       setOperationId(null);
@@ -859,7 +1292,8 @@ export default function App() {
       }
 
       resetMenuForm();
-      await loadMenu();
+        await loadMenu();
+      if (canUseAdmin(user)) await loadAdminData();
     } catch (menuError) {
       setActionError("菜單儲存失敗，請確認欄位與 boss 權限。");
       console.error(menuError);
@@ -877,6 +1311,11 @@ export default function App() {
       await fetchApiData<MenuItem>(`/api/menu/${item.id}`, { method: "DELETE" });
       await loadMenu();
       if (editingMenuId === item.id) resetMenuForm();
+      if (recipeMenuItem?.id === item.id) {
+        setRecipeMenuItem(null);
+        setRecipeRows([]);
+        setProductIngredients([]);
+      }
     } catch (menuError) {
       setActionError("刪除菜單失敗，請確認 boss 權限。");
       console.error(menuError);
@@ -897,19 +1336,254 @@ export default function App() {
       });
       await loadMenu();
     } catch (menuError) {
-      setActionError("更新販售狀態失敗，請確認 boss 權限。");
+      setActionError("更新可售狀態失敗，請確認 boss 權限。");
       console.error(menuError);
     } finally {
       setOperationId(null);
     }
   }
 
+  function editIngredient(ingredient: Ingredient) {
+    setEditingIngredientId(ingredient.id);
+    setIngredientForm({
+      name: ingredient.name,
+      stock: String(ingredient.stock),
+      unit: ingredient.unit,
+      reorderLevel: String(ingredient.reorderLevel ?? 0),
+    });
+  }
+
+  function resetIngredientForm() {
+    setEditingIngredientId(null);
+    setIngredientForm(emptyIngredientForm);
+  }
+
+  async function saveIngredient() {
+    const payload = {
+      name: ingredientForm.name.trim(),
+      stock: Number(ingredientForm.stock),
+      unit: ingredientForm.unit.trim(),
+      reorderLevel: Number(ingredientForm.reorderLevel || 0),
+    };
+
+    if (!payload.name || !payload.unit || !Number.isFinite(payload.stock)) {
+      setActionError("請填寫完整食材資料。");
+      return;
+    }
+
+    setOperationId("save-ingredient");
+    setActionError("");
+
+    try {
+      if (editingIngredientId) {
+        await fetchApiData<Ingredient>(`/api/ingredients/${editingIngredientId}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+      } else {
+        await fetchApiData<Ingredient>("/api/ingredients", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+      }
+
+      resetIngredientForm();
+      await loadAdminData();
+    } catch (ingredientError) {
+      setActionError("食材儲存失敗。");
+      console.error(ingredientError);
+    } finally {
+      setOperationId(null);
+    }
+  }
+
+  async function deleteIngredient(ingredient: Ingredient) {
+    if (!window.confirm(`刪除食材 ${ingredient.name}？`)) return;
+    setOperationId(`delete-ingredient-${ingredient.id}`);
+    setActionError("");
+
+    try {
+      await fetchApiData<Ingredient>(`/api/ingredients/${ingredient.id}`, {
+        method: "DELETE",
+      });
+      if (editingIngredientId === ingredient.id) resetIngredientForm();
+      await loadAdminData();
+    } catch (ingredientError) {
+      setActionError("食材刪除失敗。");
+      console.error(ingredientError);
+    } finally {
+      setOperationId(null);
+    }
+  }
+
+  function editTable(table: DiningTable) {
+    setEditingTableId(table.id);
+    setTableForm({
+      code: table.code,
+      capacity: String(table.capacity),
+      status: table.status,
+      currentOrderId: table.currentOrderId ? String(table.currentOrderId) : "",
+    });
+  }
+
+  function resetTableForm() {
+    setEditingTableId(null);
+    setTableForm(emptyTableForm);
+  }
+
+  async function saveTable() {
+    const capacity = Number(tableForm.capacity);
+    if (!tableForm.code.trim() || !Number.isFinite(capacity) || capacity <= 0) {
+      setActionError("請填寫桌號與正確人數。");
+      return;
+    }
+
+    setOperationId("save-table");
+    setActionError("");
+
+    try {
+      if (editingTableId) {
+        await fetchApiData<DiningTable>(`/api/tables/${editingTableId}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            code: tableForm.code.trim(),
+            capacity,
+            status: tableForm.status,
+            currentOrderId: tableForm.currentOrderId
+              ? Number(tableForm.currentOrderId)
+              : null,
+          }),
+        });
+      } else {
+        await fetchApiData<DiningTable>("/api/tables", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            code: tableForm.code.trim(),
+            capacity,
+          }),
+        });
+      }
+
+      resetTableForm();
+      await loadAdminData();
+      if (orderType === "dine_in") await loadAvailableTables();
+    } catch (tableError) {
+      setActionError("桌位儲存失敗。");
+      console.error(tableError);
+    } finally {
+      setOperationId(null);
+    }
+  }
+
+  async function deleteTable(table: DiningTable) {
+    if (!window.confirm(`刪除桌位 ${table.code}？`)) return;
+    setOperationId(`delete-table-${table.id}`);
+    setActionError("");
+
+    try {
+      await fetchApiData<DiningTable>(`/api/tables/${table.id}`, {
+        method: "DELETE",
+      });
+      if (editingTableId === table.id) resetTableForm();
+      await loadAdminData();
+      if (orderType === "dine_in") await loadAvailableTables();
+    } catch (tableError) {
+      setActionError("桌位刪除失敗。");
+      console.error(tableError);
+    } finally {
+      setOperationId(null);
+    }
+  }
+
+  async function loadAdminOrderDetail(targetOrderId: number) {
+    setActionError("");
+    try {
+      const order = await fetchApiData<Order>(`/api/orders/${targetOrderId}`);
+      setAdminOrderDetail(order);
+    } catch (orderError) {
+      setActionError("訂單詳情讀取失敗。");
+      console.error(orderError);
+    }
+  }
+
+  async function openRecipeEditor(item: MenuItem) {
+    setRecipeMenuItem(item);
+    setActionError("");
+
+    try {
+      const relations = await fetchApiData<ProductIngredient[]>(
+        `/api/menu/${item.id}/ingredients`,
+      );
+      setProductIngredients(Array.isArray(relations) ? relations : []);
+      setRecipeRows(
+        relations.length > 0
+          ? relations.map((relation) => ({
+              ingredientId: String(relation.ingredientId),
+              quantity: String(relation.quantity),
+            }))
+          : [{ ingredientId: "", quantity: "1" }],
+      );
+    } catch (recipeError) {
+      setActionError("品項食材設定讀取失敗。");
+      console.error(recipeError);
+    }
+  }
+
+  async function saveRecipe() {
+    if (!recipeMenuItem) return;
+
+    const ingredientsPayload = recipeRows
+      .map((row) => ({
+        ingredientId: Number(row.ingredientId),
+        quantity: Number(row.quantity),
+      }))
+      .filter(
+        (row) =>
+          Number.isInteger(row.ingredientId) &&
+          row.ingredientId > 0 &&
+          Number.isFinite(row.quantity) &&
+          row.quantity > 0,
+      );
+
+    setOperationId("save-recipe");
+    setActionError("");
+
+    try {
+      const updated = await fetchApiData<ProductIngredient[]>(
+        `/api/menu/${recipeMenuItem.id}/ingredients`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ingredients: ingredientsPayload }),
+        },
+      );
+      setProductIngredients(Array.isArray(updated) ? updated : []);
+      setRecipeRows(
+        updated.length > 0
+          ? updated.map((relation) => ({
+              ingredientId: String(relation.ingredientId),
+              quantity: String(relation.quantity),
+            }))
+          : [{ ingredientId: "", quantity: "1" }],
+      );
+    } catch (recipeError) {
+      setActionError("品項食材設定儲存失敗。");
+      console.error(recipeError);
+    } finally {
+      setOperationId(null);
+    }
+  }
+
   function renderLoginPanel(targetView: AppView) {
-    const title = targetView === "admin" ? "後台登入" : "廚房登入";
+    const title = targetView === "admin" ? "老闆登入" : "廚房登入";
     const hint =
       targetView === "admin"
-        ? "此頁需要 boss 權限。"
-        : "此頁需要工作人員或 boss 權限。";
+        ? "需要 manager 權限。"
+        : "需要 staff 或 manager 權限。";
 
     return (
       <section className="max-w-md mx-auto card bg-base-100 shadow-md">
@@ -943,19 +1617,50 @@ export default function App() {
           <button
             className="btn btn-primary"
             onClick={() => void handleLogin()}
-            disabled={isLoggingIn || isGoogleSigningIn}
+            disabled={isLoggingIn || isRegistering || isGoogleSigningIn}
           >
             {isLoggingIn ? "登入中..." : "登入"}
           </button>
           <button
             className="btn btn-outline"
             onClick={() => void handleGoogleSignIn()}
-            disabled={isLoggingIn || isGoogleSigningIn}
+            disabled={isLoggingIn || isRegistering || isGoogleSigningIn}
           >
             {isGoogleSigningIn ? "Google..." : "Google 登入"}
           </button>
         </div>
       </section>
+    );
+  }
+
+  function renderOrderActions(targetOrderId: number) {
+    return (
+      <div className="flex flex-wrap gap-2">
+        <button
+          className="btn btn-xs btn-outline"
+          onClick={() => void loadCustomerOrderDetail(targetOrderId)}
+        >
+          詳情
+        </button>
+        <button
+          className="btn btn-xs btn-outline"
+          onClick={() => void loadTracking(targetOrderId)}
+        >
+          追蹤
+        </button>
+        <button
+          className="btn btn-xs btn-outline"
+          onClick={() => void loadEstimate(targetOrderId)}
+        >
+          預估
+        </button>
+        <button
+          className="btn btn-xs btn-outline"
+          onClick={() => void loadPickupQr(targetOrderId)}
+        >
+          取餐碼
+        </button>
+      </div>
     );
   }
 
@@ -976,11 +1681,11 @@ export default function App() {
           </div>
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
             <div className="stat bg-base-200 rounded-lg">
-              <div className="stat-title">付款金額</div>
+              <div className="stat-title">總金額</div>
               <div className="stat-value text-primary">${submittedOrder.total}</div>
             </div>
             <div className="stat bg-base-200 rounded-lg">
-              <div className="stat-title">預估取餐</div>
+              <div className="stat-title">預估完成</div>
               <div className="stat-value text-lg">
                 {formatDateTime(submittedOrder.estimatedReadyAt)}
               </div>
@@ -992,6 +1697,98 @@ export default function App() {
               </div>
             </div>
           </div>
+          {renderOrderActions(submittedOrder.id)}
+        </div>
+      </section>
+    );
+  }
+
+  function renderCustomerOrderTools() {
+    if (!customerOrderDetail && !trackingResult && !estimateResult && !pickupQr) {
+      return null;
+    }
+
+    return (
+      <section className="mb-6 card bg-base-100 shadow-md">
+        <div className="card-body">
+          <div className="flex items-center justify-between gap-3">
+            <h2 className="card-title">訂單查詢結果</h2>
+            <button
+              className="btn btn-sm btn-ghost"
+              onClick={() => {
+                setCustomerOrderDetail(null);
+                setTrackingResult(null);
+                setEstimateResult(null);
+                setPickupQr(null);
+              }}
+            >
+              清除
+            </button>
+          </div>
+
+          {customerOrderDetail ? (
+            <div className="rounded-lg bg-base-200 p-3">
+              <p className="font-semibold">訂單 #{customerOrderDetail.id}</p>
+              <p className="text-sm opacity-70">
+                {orderTypeLabel[customerOrderDetail.orderType]} /{" "}
+                {packageTypeLabel[customerOrderDetail.packageType]} / $
+                {customerOrderDetail.total}
+              </p>
+              <ul className="mt-2 text-sm space-y-1">
+                {customerOrderDetail.items.map((detail) => (
+                  <li
+                    key={`${customerOrderDetail.id}-${detail.item.id}`}
+                    className="flex justify-between gap-3"
+                  >
+                    <span>{detail.item.name} x {detail.qty}</span>
+                    <span>{orderItemStatusLabel[detail.status]}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+
+          {trackingResult ? (
+            <div className="rounded-lg bg-base-200 p-3">
+              <p className="font-semibold">追蹤訂單 #{trackingResult.orderId}</p>
+              <p className="text-sm opacity-70">
+                {orderStatusLabel[trackingResult.status]} / 預估{" "}
+                {formatDateTime(trackingResult.estimatedReadyAt)}
+              </p>
+              <div className="mt-2 flex flex-wrap gap-2">
+                {trackingResult.itemStatuses.map((item) => (
+                  <span key={item.itemId} className="badge badge-outline">
+                    {item.name}: {orderItemStatusLabel[item.status]}
+                  </span>
+                ))}
+              </div>
+            </div>
+          ) : null}
+
+          {estimateResult ? (
+            <div className="rounded-lg bg-base-200 p-3">
+              <p className="font-semibold">預估完成時間</p>
+              <p className="text-sm opacity-70">
+                約 {estimateResult.totalMinutes} 分鐘，完成時間{" "}
+                {formatDateTime(estimateResult.estimatedReadyAt)}
+              </p>
+              <div className="mt-2 grid grid-cols-2 md:grid-cols-4 gap-2 text-sm">
+                <span>排隊 {estimateResult.queueMinutes} 分</span>
+                <span>製作 {estimateResult.cookingMinutes} 分</span>
+                <span>包裝 {estimateResult.packagingMinutes} 分</span>
+                <span>批次節省 {estimateResult.batchSavingMinutes} 分</span>
+              </div>
+            </div>
+          ) : null}
+
+          {pickupQr ? (
+            <div className="rounded-lg bg-base-200 p-3">
+              <p className="font-semibold">取餐碼</p>
+              <p className="mt-1 text-2xl font-bold tracking-wide">
+                {pickupQr.pickupCode ?? "-"}
+              </p>
+            </div>
+          ) : null}
         </div>
       </section>
     );
@@ -1019,9 +1816,7 @@ export default function App() {
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
               <h2 className="card-title">歷史訂單</h2>
-              <p className="text-sm opacity-70">
-                {user.name} 登入中，可查看之前訂過的菜單。
-              </p>
+              <p className="text-sm opacity-70">{user.name} 的訂餐紀錄。</p>
             </div>
             <button
               className="btn btn-sm btn-outline"
@@ -1034,7 +1829,7 @@ export default function App() {
 
           {historyLoading ? (
             <div className="alert">
-              <span>讀取歷史訂單中...</span>
+              <span>讀取歷史訂單...</span>
             </div>
           ) : orderHistory.length === 0 ? (
             <div className="alert alert-info">
@@ -1042,7 +1837,7 @@ export default function App() {
             </div>
           ) : (
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
-              {orderHistory.slice(0, 6).map((order) => (
+              {orderHistory.slice(0, 8).map((order) => (
                 <article
                   key={order.id}
                   className="rounded-lg border border-base-300 p-3 bg-base-200"
@@ -1064,34 +1859,144 @@ export default function App() {
                         key={`${order.id}-${detail.item.id}`}
                         className="flex justify-between gap-3"
                       >
-                        <span>
-                          {detail.item.name} x {detail.qty}
-                        </span>
+                        <span>{detail.item.name} x {detail.qty}</span>
                         <span>${detail.item.price * detail.qty}</span>
                       </li>
                     ))}
                   </ul>
-                  <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
+                  <div className="mt-3 space-y-2">
                     <div className="text-sm">
-                      <span className="font-semibold">總額 ${order.total}</span>
+                      <span className="font-semibold">總計 ${order.total}</span>
                       <span className="ml-3 opacity-70">
-                        取餐 {formatDateTime(order.estimatedReadyAt)}
+                        預估 {formatDateTime(order.estimatedReadyAt)}
                       </span>
                     </div>
-                    <button
-                      className="btn btn-xs btn-primary"
-                      onClick={() => void reorderFromHistory(order.id)}
-                      disabled={operationId === `reorder-${order.id}`}
-                    >
-                      {operationId === `reorder-${order.id}`
-                        ? "加入中..."
-                        : "再點一次"}
-                    </button>
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      {renderOrderActions(order.id)}
+                      <button
+                        className="btn btn-xs btn-primary"
+                        onClick={() => void reorderFromHistory(order.id)}
+                        disabled={operationId === `reorder-${order.id}`}
+                      >
+                        {operationId === `reorder-${order.id}`
+                          ? "加入中..."
+                          : "再點一次"}
+                      </button>
+                    </div>
                   </div>
                 </article>
               ))}
             </div>
           )}
+        </div>
+      </section>
+    );
+  }
+
+  function renderOrderOptionsPanel() {
+    if (!user) return null;
+
+    const selectedTable = availableTables.find(
+      (table) => table.id === selectedTableId,
+    );
+
+    return (
+      <section className="mb-6 card bg-base-100 shadow-md">
+        <div className="card-body">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h2 className="card-title">點餐設定</h2>
+              <p className="text-sm opacity-70">
+                先確認外帶或內用，再開始加入餐點。
+              </p>
+            </div>
+            <span className="badge badge-outline">
+              {orderTypeLabel[orderType]}
+              {orderType === "dine_in" && selectedTable
+                ? ` / ${selectedTable.code}`
+                : ""}
+            </span>
+          </div>
+
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+            <div className="space-y-2">
+              <p className="text-sm font-semibold">用餐方式</p>
+              <div className="join w-full">
+                <button
+                  className={`btn join-item flex-1 ${
+                    orderType === "takeout" ? "btn-primary" : "btn-outline"
+                  }`}
+                  onClick={() => setOrderType("takeout")}
+                >
+                  外帶
+                </button>
+                <button
+                  className={`btn join-item flex-1 ${
+                    orderType === "dine_in" ? "btn-primary" : "btn-outline"
+                  }`}
+                  onClick={() => setOrderType("dine_in")}
+                >
+                  內用
+                </button>
+              </div>
+            </div>
+
+            {orderType === "takeout" ? (
+              <div className="space-y-2 lg:col-span-2">
+                <p className="text-sm font-semibold">包裝方式</p>
+                <div className="join w-full">
+                  <button
+                    className={`btn join-item flex-1 ${
+                      packageType === "together" ? "btn-primary" : "btn-outline"
+                    }`}
+                    onClick={() => setPackageType("together")}
+                  >
+                    集中包裝
+                  </button>
+                  <button
+                    className={`btn join-item flex-1 ${
+                      packageType === "separate" ? "btn-primary" : "btn-outline"
+                    }`}
+                    onClick={() => setPackageType("separate")}
+                  >
+                    分開包裝
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="space-y-2 lg:col-span-2">
+                <div className="flex items-center justify-between gap-3">
+                  <p className="text-sm font-semibold">可用桌位</p>
+                  <button
+                    className="btn btn-xs btn-outline"
+                    onClick={() => void loadAvailableTables()}
+                    disabled={tablesLoading}
+                  >
+                    {tablesLoading ? "更新中" : "重新整理"}
+                  </button>
+                </div>
+                <select
+                  className="select select-bordered w-full"
+                  value={selectedTableId ?? ""}
+                  onChange={(event) =>
+                    setSelectedTableId(
+                      event.target.value ? Number(event.target.value) : null,
+                    )
+                  }
+                >
+                  <option value="">請選擇桌位</option>
+                  {availableTables.map((table) => (
+                    <option key={table.id} value={table.id}>
+                      {table.code} / {table.capacity} 人桌
+                    </option>
+                  ))}
+                </select>
+                {availableTables.length === 0 && !tablesLoading ? (
+                  <p className="text-sm text-warning">目前沒有可用桌位。</p>
+                ) : null}
+              </div>
+            )}
+          </div>
         </div>
       </section>
     );
@@ -1104,13 +2009,20 @@ export default function App() {
           <section className="mb-6 card bg-base-100 shadow-md">
             <div className="card-body flex flex-col md:flex-row md:items-center md:justify-between gap-4">
               <div>
-                <h2 className="card-title">直接點餐</h2>
+                <h2 className="card-title">開始點餐</h2>
                 <p className="text-sm opacity-70">
-                  不需要會員或 Google 登入，也可以先選餐送單。
+                  可註冊會員、登入、使用 Google，或直接用訪客點餐。
                 </p>
               </div>
               <div className="w-full md:w-80 space-y-2">
-                <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-1 gap-2">
+                <div className="grid grid-cols-1 sm:grid-cols-3 md:grid-cols-1 gap-2">
+                  <input
+                    className="input input-bordered input-sm"
+                    placeholder="姓名（註冊用）"
+                    autoComplete="name"
+                    value={nameInput}
+                    onChange={(event) => setNameInput(event.target.value)}
+                  />
                   <input
                     className="input input-bordered input-sm"
                     placeholder="Email"
@@ -1127,20 +2039,27 @@ export default function App() {
                     onChange={(event) => setPasswordInput(event.target.value)}
                   />
                 </div>
-                <div className="grid grid-cols-2 gap-2">
+                <div className="grid grid-cols-3 gap-2">
                   <button
                     className="btn btn-sm btn-outline"
                     onClick={() => void handleLogin()}
-                    disabled={isLoggingIn || isGoogleSigningIn}
+                    disabled={isLoggingIn || isRegistering || isGoogleSigningIn}
                   >
-                    {isLoggingIn ? "登入中..." : "會員登入"}
+                    {isLoggingIn ? "登入中" : "登入"}
+                  </button>
+                  <button
+                    className="btn btn-sm btn-primary"
+                    onClick={() => void handleRegister()}
+                    disabled={isLoggingIn || isRegistering || isGoogleSigningIn}
+                  >
+                    {isRegistering ? "註冊中" : "註冊"}
                   </button>
                   <button
                     className="btn btn-sm btn-outline"
                     onClick={() => void handleGoogleSignIn()}
-                    disabled={isLoggingIn || isGoogleSigningIn}
+                    disabled={isLoggingIn || isRegistering || isGoogleSigningIn}
                   >
-                    {isGoogleSigningIn ? "Google..." : "Google 登入"}
+                    {isGoogleSigningIn ? "Google..." : "Google"}
                   </button>
                 </div>
                 {authError ? (
@@ -1150,83 +2069,188 @@ export default function App() {
                 ) : null}
               </div>
               <button className="btn btn-primary" onClick={handleGuestOrder}>
-                開始點餐
+                訪客點餐
               </button>
             </div>
           </section>
         ) : null}
 
+        {renderOrderOptionsPanel()}
         {renderSubmittedOrder()}
+        {renderCustomerOrderTools()}
         {renderOrderHistory()}
-
-        {items.length === 0 ? (
-          <div className="alert alert-info">
-            <span>目前沒有可販售的品項。</span>
-          </div>
-        ) : (
-          grouped.categories.map((category) => (
-            <section key={category} className="mb-8">
-              <h2 className="text-3xl font-bold mb-4 text-primary border-b-2 border-primary pb-2">
-                {category}
-              </h2>
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                {(grouped.groupedItems[category] || []).map((item) => (
-                  <article
-                    key={item.id}
-                    className="card bg-base-100 shadow-md hover:shadow-lg transition-shadow"
-                  >
-                    <figure className="h-44 overflow-hidden bg-base-300">
-                      <img
-                        src={item.image_url}
-                        alt={item.name}
-                        className="w-full h-full object-cover"
-                        loading="lazy"
-                        onError={(event) => {
-                          event.currentTarget.src =
-                            "https://images.unsplash.com/photo-1526318896980-cf78c088247c?auto=format&fit=crop&w=800&q=80";
-                        }}
-                      />
-                    </figure>
-                    <div className="card-body">
-                      <div className="flex items-start justify-between gap-3">
-                        <h3 className="card-title text-lg">{item.name}</h3>
-                        {!item.is_available ? (
-                          <span className="badge badge-neutral">停售</span>
-                        ) : null}
-                      </div>
-                      <p className="text-sm opacity-80 line-clamp-2 min-h-[2.75rem]">
-                        {item.description}
-                      </p>
-                      <div className="card-actions justify-between items-center">
-                        <span className="text-xl font-bold text-success">
-                          ${item.price}
-                        </span>
-                        <button
-                          className="btn btn-sm btn-primary"
-                          onClick={() => void addToCart(item)}
-                          disabled={
-                            !user ||
-                            !item.is_available ||
-                            activeItemId === item.id
-                          }
-                        >
-                          {activeItemId === item.id
-                            ? "加入中..."
-                            : `加入購物車${
-                                cartQtyByItemId[item.id]
-                                  ? ` (${cartQtyByItemId[item.id]})`
-                                  : ""
-                              }`}
-                        </button>
-                      </div>
-                    </div>
-                  </article>
-                ))}
-              </div>
-            </section>
-          ))
-        )}
+        {renderMenuDiscovery()}
+        {renderMenuGrid()}
       </>
+    );
+  }
+
+  function renderMenuDiscovery() {
+    return (
+      <section className="mb-6 card bg-base-100 shadow-md">
+        <div className="card-body">
+          {lastCompletedOrder ? (
+            <div className="mb-4 rounded-lg border border-base-300 bg-base-200 p-4">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <h3 className="font-bold">上次點過</h3>
+                  <p className="text-sm opacity-70">
+                    訂單 #{lastCompletedOrder.id} /{" "}
+                    {formatDateTime(lastCompletedOrder.createdAt)} / $
+                    {lastCompletedOrder.total}
+                  </p>
+                </div>
+                <button
+                  className="btn btn-sm btn-primary"
+                  onClick={() => void reorderFromHistory(lastCompletedOrder.id)}
+                  disabled={operationId === `reorder-${lastCompletedOrder.id}`}
+                >
+                  {operationId === `reorder-${lastCompletedOrder.id}`
+                    ? "加入中"
+                    : "再點一次"}
+                </button>
+              </div>
+              <ul className="mt-3 grid grid-cols-1 md:grid-cols-2 gap-2 text-sm">
+                {lastCompletedOrder.items.map((detail) => (
+                  <li
+                    key={`${lastCompletedOrder.id}-${detail.item.id}`}
+                    className="flex justify-between gap-3 rounded bg-base-100 px-3 py-2"
+                  >
+                    <span>{detail.item.name}</span>
+                    <span>
+                      x {detail.qty} / ${detail.item.price * detail.qty}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <h2 className="card-title">菜單</h2>
+            <div className="join">
+              {customerMenuTabs.map((tab) => (
+                <button
+                  key={tab}
+                  className={`btn join-item ${
+                    selectedCustomerMenuTab === tab ? "btn-primary" : "btn-outline"
+                  }`}
+                  onClick={() => setSelectedCustomerMenuTab(tab)}
+                >
+                  {tab} {customerMenuCounts[tab]}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {selectedMenuDetail ? (
+            <div className="mt-4 rounded-lg border border-base-300 p-4">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <h3 className="text-xl font-bold">{selectedMenuDetail.name}</h3>
+                  <p className="text-sm opacity-70">
+                    {selectedMenuDetail.category} / 約{" "}
+                    {selectedMenuDetail.default_time} 分鐘 / $
+                    {selectedMenuDetail.price}
+                  </p>
+                </div>
+                <button
+                  className="btn btn-sm btn-ghost"
+                  onClick={() => setSelectedMenuDetail(null)}
+                >
+                  關閉
+                </button>
+              </div>
+              <p className="mt-2 text-sm">{selectedMenuDetail.description}</p>
+            </div>
+          ) : null}
+        </div>
+      </section>
+    );
+  }
+
+  function renderMenuGrid() {
+    if (items.length === 0) {
+      return (
+        <div className="alert alert-info">
+          <span>目前沒有菜單品項。</span>
+        </div>
+      );
+    }
+
+    if (customerMenuItems.length === 0) {
+      return (
+        <div className="alert alert-info">
+          <span>目前沒有{selectedCustomerMenuTab}品項。</span>
+        </div>
+      );
+    }
+
+    return (
+      <section className="mb-8">
+        <h2 className="text-3xl font-bold mb-4 text-primary border-b-2 border-primary pb-2">
+          {selectedCustomerMenuTab}
+        </h2>
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          {customerMenuItems.map((item) => (
+            <article
+              key={item.id}
+              className="card bg-base-100 shadow-md hover:shadow-lg transition-shadow"
+            >
+              <figure className="h-44 overflow-hidden bg-base-300">
+                <img
+                  src={item.image_url}
+                  alt={item.name}
+                  className="w-full h-full object-cover"
+                  loading="lazy"
+                  onError={(event) => {
+                    event.currentTarget.src =
+                      "https://images.unsplash.com/photo-1526318896980-cf78c088247c?auto=format&fit=crop&w=800&q=80";
+                  }}
+                />
+              </figure>
+              <div className="card-body">
+                <div className="flex items-start justify-between gap-3">
+                  <h3 className="card-title text-lg">{item.name}</h3>
+                  {!item.is_available ? (
+                    <span className="badge badge-neutral">售完</span>
+                  ) : null}
+                </div>
+                <p className="text-sm opacity-80 line-clamp-2 min-h-[2.75rem]">
+                  {item.description}
+                </p>
+                <div className="card-actions justify-between items-center">
+                  <span className="text-xl font-bold text-success">
+                    ${item.price}
+                  </span>
+                  <div className="flex gap-2">
+                    <button
+                      className="btn btn-sm btn-outline"
+                      onClick={() => void loadMenuDetail(item.id)}
+                    >
+                      詳情
+                    </button>
+                    <button
+                      className="btn btn-sm btn-primary"
+                      onClick={() => void addToCart(item)}
+                      disabled={
+                        !user || !item.is_available || activeItemId === item.id
+                      }
+                    >
+                      {activeItemId === item.id
+                        ? "加入中..."
+                        : `加入${
+                            cartQtyByItemId[item.id]
+                              ? ` (${cartQtyByItemId[item.id]})`
+                              : ""
+                          }`}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </article>
+          ))}
+        </div>
+      </section>
     );
   }
 
@@ -1236,13 +2260,13 @@ export default function App() {
         <div className="card-body">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
-              <h3 className="card-title">售完品項</h3>
+              <h3 className="card-title">售完控制</h3>
               <p className="text-sm opacity-70">
                 廚房可即時標記售完，顧客菜單會立刻停用該品項。
               </p>
             </div>
             <span className="badge badge-neutral">
-              {items.filter((item) => !item.is_available).length} 項售完
+              {items.filter((item) => !item.is_available).length} 個售完
             </span>
           </div>
           <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-2">
@@ -1264,7 +2288,7 @@ export default function App() {
                   }
                   disabled={operationId === `kds-menu-${item.id}`}
                 >
-                  {item.is_available ? "設為售完" : "恢復販售"}
+                  {item.is_available ? "標記售完" : "恢復可售"}
                 </button>
               </div>
             ))}
@@ -1283,7 +2307,7 @@ export default function App() {
           <div>
             <h2 className="text-3xl font-bold">廚房 KDS</h2>
             <p className="text-sm opacity-70">
-              目前待處理 {kdsOrders.length} 筆訂單
+              目前 active 訂單 {kdsOrders.length} 張。
             </p>
           </div>
           <button
@@ -1295,153 +2319,242 @@ export default function App() {
           </button>
         </div>
 
-        {renderKdsAvailabilityControls()}
+        <div className="grid grid-cols-1 xl:grid-cols-[1fr_22rem] gap-5">
+          <div className="space-y-5">
+            {renderKdsAvailabilityControls()}
+            {renderKdsOrders()}
+          </div>
+          <aside className="space-y-5">
+            {renderKdsQueue()}
+            {renderPickupVerifier()}
+            {renderKdsBatches()}
+          </aside>
+        </div>
+      </section>
+    );
+  }
 
-        {kdsLoading ? (
-          <div className="alert">
-            <span>讀取廚房訂單中...</span>
-          </div>
-        ) : kdsOrders.length === 0 ? (
-          <div className="alert alert-info">
-            <span>目前沒有廚房訂單。</span>
-          </div>
-        ) : (
-          <div className="grid grid-cols-1 xl:grid-cols-[1fr_20rem] gap-5">
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-              {kdsOrders.map((order) => (
-                <article
-                  key={order.id}
-                  className="card bg-base-100 shadow-md border border-base-300"
-                >
-                  <div className="card-body">
-                    <div className="flex flex-wrap items-center justify-between gap-2">
-                      <h3 className="text-xl font-bold">訂單 #{order.id}</h3>
-                      <span className={`badge ${orderStatusClass(order.status)}`}>
-                        {orderStatusLabel[order.status]}
+  function renderKdsOrders() {
+    if (kdsLoading) {
+      return (
+        <div className="alert">
+          <span>讀取廚房訂單...</span>
+        </div>
+      );
+    }
+
+    if (kdsOrders.length === 0) {
+      return (
+        <div className="alert alert-info">
+          <span>目前沒有廚房訂單。</span>
+        </div>
+      );
+    }
+
+    return (
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        {kdsOrders.map((order) => (
+          <article
+            key={order.id}
+            className="card bg-base-100 shadow-md border border-base-300"
+          >
+            <div className="card-body">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <h3 className="text-xl font-bold">訂單 #{order.id}</h3>
+                <span className={`badge ${orderStatusClass(order.status)}`}>
+                  {orderStatusLabel[order.status]}
+                </span>
+              </div>
+              <div className="text-sm opacity-70 space-y-1">
+                <p>建立：{formatDateTime(order.createdAt)}</p>
+                <p>預估：{formatDateTime(order.estimatedReadyAt)}</p>
+                <p>取餐碼：{order.pickupCode ?? "-"}</p>
+                <p>
+                  {orderTypeLabel[order.orderType]} /{" "}
+                  {packageTypeLabel[order.packageType]}
+                  {order.tableId ? ` / 桌位 #${order.tableId}` : ""}
+                </p>
+              </div>
+
+              <div className="space-y-3">
+                {order.items.map((detail) => (
+                  <div
+                    key={`${order.id}-${detail.item.id}`}
+                    className="rounded-lg bg-base-200 p-3"
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <div>
+                        <p className="font-semibold">
+                          {detail.item.name} x {detail.qty}
+                        </p>
+                        {detail.note ? (
+                          <p className="text-sm opacity-70">備註：{detail.note}</p>
+                        ) : null}
+                      </div>
+                      <span className="badge badge-outline">
+                        {orderItemStatusLabel[detail.status]}
                       </span>
                     </div>
-                    <div className="text-sm opacity-70 space-y-1">
-                      <p>建立：{formatDateTime(order.createdAt)}</p>
-                      <p>預計：{formatDateTime(order.estimatedReadyAt)}</p>
-                      <p>取餐碼：{order.pickupCode ?? "-"}</p>
-                    </div>
-
-                    <div className="space-y-3">
-                      {order.items.map((detail) => (
-                        <div
-                          key={`${order.id}-${detail.item.id}`}
-                          className="rounded-lg bg-base-200 p-3"
-                        >
-                          <div className="flex items-center justify-between gap-2">
-                            <div>
-                              <p className="font-semibold">
-                                {detail.item.name} x {detail.qty}
-                              </p>
-                              {detail.note ? (
-                                <p className="text-sm opacity-70">
-                                  備註：{detail.note}
-                                </p>
-                              ) : null}
-                            </div>
-                            <span className="badge badge-outline">
-                              {orderItemStatusLabel[detail.status]}
-                            </span>
-                          </div>
-                          <div className="mt-3 flex flex-wrap gap-2">
-                            <button
-                              className="btn btn-xs btn-outline"
-                              onClick={() =>
-                                void updateKdsItemStatus(
-                                  order.id,
-                                  detail.item.id,
-                                  "preparing",
-                                )
-                              }
-                              disabled={
-                                operationId ===
-                                `item-${order.id}-${detail.item.id}-preparing`
-                              }
-                            >
-                              製作中
-                            </button>
-                            <button
-                              className="btn btn-xs btn-outline"
-                              onClick={() =>
-                                void updateKdsItemStatus(
-                                  order.id,
-                                  detail.item.id,
-                                  "ready",
-                                )
-                              }
-                              disabled={
-                                operationId ===
-                                `item-${order.id}-${detail.item.id}-ready`
-                              }
-                            >
-                              完成品項
-                            </button>
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-
-                    <div className="card-actions justify-end">
+                    <div className="mt-3 flex flex-wrap gap-2">
                       <button
-                        className="btn btn-sm"
-                        onClick={() => void updateKdsStatus(order.id, "preparing")}
-                        disabled={operationId === `order-${order.id}-preparing`}
-                      >
-                        開始製作
-                      </button>
-                      <button
-                        className="btn btn-sm btn-success"
-                        onClick={() => void updateKdsStatus(order.id, "ready")}
-                        disabled={operationId === `order-${order.id}-ready`}
-                      >
-                        待取餐
-                      </button>
-                      <button
-                        className="btn btn-sm btn-neutral"
+                        className="btn btn-xs btn-outline"
                         onClick={() =>
-                          void updateKdsStatus(order.id, "completed")
+                          void updateKdsItemStatus(
+                            order.id,
+                            detail.item.id,
+                            "preparing",
+                          )
                         }
-                        disabled={operationId === `order-${order.id}-completed`}
+                        disabled={
+                          operationId ===
+                          `item-${order.id}-${detail.item.id}-preparing`
+                        }
                       >
-                        完成
+                        製作中
+                      </button>
+                      <button
+                        className="btn btn-xs btn-outline"
+                        onClick={() =>
+                          void updateKdsItemStatus(order.id, detail.item.id, "ready")
+                        }
+                        disabled={
+                          operationId ===
+                          `item-${order.id}-${detail.item.id}-ready`
+                        }
+                      >
+                        完成品項
                       </button>
                     </div>
                   </div>
-                </article>
+                ))}
+              </div>
+
+              <div className="card-actions justify-end">
+                <button
+                  className="btn btn-sm"
+                  onClick={() => void updateKdsStatus(order.id, "preparing")}
+                  disabled={operationId === `order-${order.id}-preparing`}
+                >
+                  開始製作
+                </button>
+                <button
+                  className="btn btn-sm btn-success"
+                  onClick={() => void updateKdsStatus(order.id, "ready")}
+                  disabled={operationId === `order-${order.id}-ready`}
+                >
+                  可取餐
+                </button>
+                <button
+                  className="btn btn-sm btn-neutral"
+                  onClick={() => void updateKdsStatus(order.id, "completed")}
+                  disabled={operationId === `order-${order.id}-completed`}
+                >
+                  完成
+                </button>
+              </div>
+            </div>
+          </article>
+        ))}
+      </div>
+    );
+  }
+
+  function renderKdsQueue() {
+    return (
+      <section className="card bg-base-100 shadow-md">
+        <div className="card-body">
+          <h3 className="card-title">生產佇列</h3>
+          {kdsQueue.length === 0 ? (
+            <p className="text-sm opacity-70">目前沒有佇列資料。</p>
+          ) : (
+            <div className="space-y-2">
+              {kdsQueue.map((queue) => (
+                <div
+                  key={queue.orderId}
+                  className="rounded-lg bg-base-200 p-3 text-sm"
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-semibold">
+                      #{queue.priority} 訂單 {queue.orderId}
+                    </span>
+                    <span className={`badge ${orderStatusClass(queue.status)}`}>
+                      {orderStatusLabel[queue.status]}
+                    </span>
+                  </div>
+                  <p className="opacity-70">
+                    {queue.itemCount} 件 / {formatDateTime(queue.estimatedReadyAt)}
+                  </p>
+                </div>
               ))}
             </div>
+          )}
+        </div>
+      </section>
+    );
+  }
 
-            <aside className="card bg-base-100 shadow-md h-fit">
-              <div className="card-body">
-                <h3 className="card-title">批次備料</h3>
-                {kdsBatches.length === 0 ? (
-                  <p className="text-sm opacity-70">目前沒有共用備料。</p>
-                ) : (
-                  <div className="space-y-3">
-                    {kdsBatches.slice(0, 6).map((batch) => (
-                      <div
-                        key={batch.ingredientId}
-                        className="rounded-lg bg-base-200 p-3"
-                      >
-                        <p className="font-semibold">{batch.ingredientName}</p>
-                        <p className="text-sm opacity-70">
-                          {batch.totalQuantity} {batch.unit}
-                        </p>
-                        <p className="text-xs opacity-60">
-                          訂單：{batch.orderIds.join(", ")}
-                        </p>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            </aside>
+  function renderPickupVerifier() {
+    return (
+      <section className="card bg-base-100 shadow-md">
+        <div className="card-body">
+          <h3 className="card-title">取餐驗證</h3>
+          <div className="join w-full">
+            <input
+              className="input input-bordered join-item w-full"
+              placeholder="輸入取餐碼"
+              value={pickupCodeInput}
+              onChange={(event) => setPickupCodeInput(event.target.value)}
+            />
+            <button
+              className="btn btn-primary join-item"
+              onClick={() => void verifyPickup()}
+              disabled={operationId === "pickup-verify"}
+            >
+              驗證
+            </button>
           </div>
-        )}
+          {pickupVerification ? (
+            <div className="rounded-lg bg-base-200 p-3 text-sm">
+              <p className="font-semibold">
+                訂單 #{pickupVerification.orderId} 已驗證
+              </p>
+              <p className="opacity-70">
+                {pickupVerification.pickupCode} /{" "}
+                {orderStatusLabel[pickupVerification.status]}
+              </p>
+            </div>
+          ) : null}
+        </div>
+      </section>
+    );
+  }
+
+  function renderKdsBatches() {
+    return (
+      <section className="card bg-base-100 shadow-md">
+        <div className="card-body">
+          <h3 className="card-title">批次製作建議</h3>
+          {kdsBatches.length === 0 ? (
+            <p className="text-sm opacity-70">目前沒有可合併批次。</p>
+          ) : (
+            <div className="space-y-3">
+              {kdsBatches.slice(0, 8).map((batch) => (
+                <div
+                  key={batch.ingredientId}
+                  className="rounded-lg bg-base-200 p-3"
+                >
+                  <p className="font-semibold">{batch.ingredientName}</p>
+                  <p className="text-sm opacity-70">
+                    {batch.totalQuantity} {batch.unit}
+                  </p>
+                  <p className="text-xs opacity-60">
+                    訂單：{batch.orderIds.join(", ")}
+                  </p>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
       </section>
     );
   }
@@ -1502,7 +2615,7 @@ export default function App() {
               />
             </label>
             <label className="form-control">
-              <span className="label-text">圖片網址</span>
+              <span className="label-text">圖片 URL</span>
               <input
                 className="input input-bordered"
                 value={menuForm.image_url}
@@ -1536,7 +2649,7 @@ export default function App() {
                   })
                 }
               />
-              <span className="label-text">上架販售</span>
+              <span className="label-text">可販售</span>
             </label>
             <div className="card-actions">
               <button
@@ -1579,7 +2692,7 @@ export default function App() {
                             item.is_available ? "badge-success" : "badge-neutral"
                           }`}
                         >
-                          {item.is_available ? "販售中" : "停售"}
+                          {item.is_available ? "可售" : "售完"}
                         </span>
                       </td>
                       <td>
@@ -1588,14 +2701,26 @@ export default function App() {
                             className="btn btn-xs btn-outline"
                             onClick={() => editMenuItem(item)}
                           >
-                            修改
+                            編輯
+                          </button>
+                          <button
+                            className="btn btn-xs btn-outline"
+                            onClick={() => void openRecipeEditor(item)}
+                          >
+                            食材
+                          </button>
+                          <button
+                            className="btn btn-xs btn-outline"
+                            onClick={() => void loadMenuDetail(item.id)}
+                          >
+                            詳情
                           </button>
                           <button
                             className="btn btn-xs btn-outline"
                             onClick={() => void toggleMenuAvailability(item)}
                             disabled={operationId === `toggle-menu-${item.id}`}
                           >
-                            {item.is_available ? "停售" : "上架"}
+                            {item.is_available ? "售完" : "可售"}
                           </button>
                           <button
                             className="btn btn-xs btn-error btn-outline"
@@ -1617,6 +2742,534 @@ export default function App() {
     );
   }
 
+  function renderRecipeManager() {
+    if (!recipeMenuItem) return null;
+
+    return (
+      <section className="card bg-base-100 shadow-md">
+        <div className="card-body">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h3 className="card-title">品項食材設定</h3>
+              <p className="text-sm opacity-70">{recipeMenuItem.name}</p>
+            </div>
+            <button
+              className="btn btn-sm btn-ghost"
+              onClick={() => {
+                setRecipeMenuItem(null);
+                setRecipeRows([]);
+                setProductIngredients([]);
+              }}
+            >
+              關閉
+            </button>
+          </div>
+
+          <div className="space-y-2">
+            {recipeRows.map((row, index) => (
+              <div key={index} className="grid grid-cols-[1fr_8rem_auto] gap-2">
+                <select
+                  className="select select-bordered select-sm"
+                  value={row.ingredientId}
+                  onChange={(event) =>
+                    setRecipeRows((current) =>
+                      current.map((target, targetIndex) =>
+                        targetIndex === index
+                          ? { ...target, ingredientId: event.target.value }
+                          : target,
+                      ),
+                    )
+                  }
+                >
+                  <option value="">選擇食材</option>
+                  {ingredients.map((ingredient) => (
+                    <option key={ingredient.id} value={ingredient.id}>
+                      {ingredient.name} ({ingredient.unit})
+                    </option>
+                  ))}
+                </select>
+                <input
+                  className="input input-bordered input-sm"
+                  inputMode="decimal"
+                  value={row.quantity}
+                  onChange={(event) =>
+                    setRecipeRows((current) =>
+                      current.map((target, targetIndex) =>
+                        targetIndex === index
+                          ? { ...target, quantity: event.target.value }
+                          : target,
+                      ),
+                    )
+                  }
+                />
+                <button
+                  className="btn btn-sm btn-ghost"
+                  onClick={() =>
+                    setRecipeRows((current) =>
+                      current.filter((_, targetIndex) => targetIndex !== index),
+                    )
+                  }
+                >
+                  移除
+                </button>
+              </div>
+            ))}
+          </div>
+
+          <div className="flex flex-wrap gap-2">
+            <button
+              className="btn btn-sm btn-outline"
+              onClick={() =>
+                setRecipeRows((current) => [
+                  ...current,
+                  { ingredientId: "", quantity: "1" },
+                ])
+              }
+            >
+              新增一列
+            </button>
+            <button
+              className="btn btn-sm btn-primary"
+              onClick={() => void saveRecipe()}
+              disabled={operationId === "save-recipe"}
+            >
+              儲存食材設定
+            </button>
+          </div>
+
+          {productIngredients.length > 0 ? (
+            <p className="text-sm opacity-70">
+              目前已設定 {productIngredients.length} 個食材需求。
+            </p>
+          ) : null}
+        </div>
+      </section>
+    );
+  }
+
+  function renderIngredientManager() {
+    return (
+      <section className="grid grid-cols-1 xl:grid-cols-[24rem_1fr] gap-5">
+        <article className="card bg-base-100 shadow-md h-fit">
+          <div className="card-body">
+            <h3 className="card-title">
+              {editingIngredientId ? "修改食材" : "新增食材"}
+            </h3>
+            <label className="form-control">
+              <span className="label-text">名稱</span>
+              <input
+                className="input input-bordered"
+                value={ingredientForm.name}
+                onChange={(event) =>
+                  setIngredientForm({ ...ingredientForm, name: event.target.value })
+                }
+              />
+            </label>
+            <div className="grid grid-cols-2 gap-2">
+              <label className="form-control">
+                <span className="label-text">庫存</span>
+                <input
+                  className="input input-bordered"
+                  inputMode="decimal"
+                  value={ingredientForm.stock}
+                  onChange={(event) =>
+                    setIngredientForm({
+                      ...ingredientForm,
+                      stock: event.target.value,
+                    })
+                  }
+                />
+              </label>
+              <label className="form-control">
+                <span className="label-text">單位</span>
+                <input
+                  className="input input-bordered"
+                  value={ingredientForm.unit}
+                  onChange={(event) =>
+                    setIngredientForm({ ...ingredientForm, unit: event.target.value })
+                  }
+                />
+              </label>
+            </div>
+            <label className="form-control">
+              <span className="label-text">補貨門檻</span>
+              <input
+                className="input input-bordered"
+                inputMode="decimal"
+                value={ingredientForm.reorderLevel}
+                onChange={(event) =>
+                  setIngredientForm({
+                    ...ingredientForm,
+                    reorderLevel: event.target.value,
+                  })
+                }
+              />
+            </label>
+            <div className="card-actions">
+              <button
+                className="btn btn-primary"
+                onClick={() => void saveIngredient()}
+                disabled={operationId === "save-ingredient"}
+              >
+                儲存
+              </button>
+              <button className="btn btn-ghost" onClick={resetIngredientForm}>
+                清空
+              </button>
+            </div>
+          </div>
+        </article>
+
+        <article className="card bg-base-100 shadow-md">
+          <div className="card-body">
+            <h3 className="card-title">食材庫存</h3>
+            <div className="overflow-x-auto">
+              <table className="table table-sm">
+                <thead>
+                  <tr>
+                    <th>名稱</th>
+                    <th>庫存</th>
+                    <th>補貨門檻</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {ingredients.map((ingredient) => (
+                    <tr key={ingredient.id}>
+                      <td>{ingredient.name}</td>
+                      <td>
+                        {ingredient.stock} {ingredient.unit}
+                      </td>
+                      <td>
+                        <span
+                          className={`badge ${
+                            ingredient.stock <= ingredient.reorderLevel
+                              ? "badge-warning"
+                              : "badge-outline"
+                          }`}
+                        >
+                          {ingredient.reorderLevel}
+                        </span>
+                      </td>
+                      <td>
+                        <div className="flex justify-end gap-2">
+                          <button
+                            className="btn btn-xs btn-outline"
+                            onClick={() => editIngredient(ingredient)}
+                          >
+                            編輯
+                          </button>
+                          <button
+                            className="btn btn-xs btn-error btn-outline"
+                            onClick={() => void deleteIngredient(ingredient)}
+                            disabled={
+                              operationId === `delete-ingredient-${ingredient.id}`
+                            }
+                          >
+                            刪除
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </article>
+      </section>
+    );
+  }
+
+  function renderTableManager() {
+    return (
+      <section className="grid grid-cols-1 xl:grid-cols-[24rem_1fr] gap-5">
+        <article className="card bg-base-100 shadow-md h-fit">
+          <div className="card-body">
+            <h3 className="card-title">
+              {editingTableId ? "修改桌位" : "新增桌位"}
+            </h3>
+            <label className="form-control">
+              <span className="label-text">桌號</span>
+              <input
+                className="input input-bordered"
+                value={tableForm.code}
+                onChange={(event) =>
+                  setTableForm({ ...tableForm, code: event.target.value })
+                }
+              />
+            </label>
+            <label className="form-control">
+              <span className="label-text">人數</span>
+              <input
+                className="input input-bordered"
+                inputMode="numeric"
+                value={tableForm.capacity}
+                onChange={(event) =>
+                  setTableForm({ ...tableForm, capacity: event.target.value })
+                }
+              />
+            </label>
+            {editingTableId ? (
+              <>
+                <label className="form-control">
+                  <span className="label-text">狀態</span>
+                  <select
+                    className="select select-bordered"
+                    value={tableForm.status}
+                    onChange={(event) =>
+                      setTableForm({
+                        ...tableForm,
+                        status: event.target.value as DiningTable["status"],
+                      })
+                    }
+                  >
+                    {Object.entries(tableStatusLabel).map(([status, label]) => (
+                      <option key={status} value={status}>
+                        {label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="form-control">
+                  <span className="label-text">目前訂單 ID</span>
+                  <input
+                    className="input input-bordered"
+                    inputMode="numeric"
+                    value={tableForm.currentOrderId}
+                    onChange={(event) =>
+                      setTableForm({
+                        ...tableForm,
+                        currentOrderId: event.target.value,
+                      })
+                    }
+                  />
+                </label>
+              </>
+            ) : null}
+            <div className="card-actions">
+              <button
+                className="btn btn-primary"
+                onClick={() => void saveTable()}
+                disabled={operationId === "save-table"}
+              >
+                儲存
+              </button>
+              <button className="btn btn-ghost" onClick={resetTableForm}>
+                清空
+              </button>
+            </div>
+          </div>
+        </article>
+
+        <article className="card bg-base-100 shadow-md">
+          <div className="card-body">
+            <h3 className="card-title">桌位管理</h3>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              {tables.map((table) => (
+                <div
+                  key={table.id}
+                  className="rounded-lg border border-base-300 p-3"
+                >
+                  <div className="flex items-center justify-between">
+                    <p className="font-semibold">{table.code}</p>
+                    <span className="badge badge-outline">
+                      {tableStatusLabel[table.status]}
+                    </span>
+                  </div>
+                  <p className="text-sm opacity-70">{table.capacity} 人桌</p>
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    {table.status === "available" ? (
+                      <button
+                        className="btn btn-xs btn-outline"
+                        onClick={() => void updateTableStatus(table.id, "seat")}
+                        disabled={operationId === `table-${table.id}-seat`}
+                      >
+                        入座
+                      </button>
+                    ) : null}
+                    {["seated", "dining", "reserved"].includes(table.status) ? (
+                      <button
+                        className="btn btn-xs btn-outline"
+                        onClick={() => void updateTableStatus(table.id, "leave")}
+                        disabled={operationId === `table-${table.id}-leave`}
+                      >
+                        離席
+                      </button>
+                    ) : null}
+                    {table.status === "cleaning" ? (
+                      <button
+                        className="btn btn-xs btn-outline"
+                        onClick={() => void updateTableStatus(table.id, "clean")}
+                        disabled={operationId === `table-${table.id}-clean`}
+                      >
+                        清潔完成
+                      </button>
+                    ) : null}
+                    <button
+                      className="btn btn-xs btn-outline"
+                      onClick={() => editTable(table)}
+                    >
+                      編輯
+                    </button>
+                    <button
+                      className="btn btn-xs btn-error btn-outline"
+                      onClick={() => void deleteTable(table)}
+                      disabled={operationId === `delete-table-${table.id}`}
+                    >
+                      刪除
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </article>
+      </section>
+    );
+  }
+
+  function renderAdminOrders() {
+    return (
+      <section className="grid grid-cols-1 xl:grid-cols-[1fr_24rem] gap-5">
+        <article className="card bg-base-100 shadow-md">
+          <div className="card-body">
+            <h3 className="card-title">全部訂單</h3>
+            <div className="overflow-x-auto">
+              <table className="table table-sm">
+                <thead>
+                  <tr>
+                    <th>ID</th>
+                    <th>狀態</th>
+                    <th>方式</th>
+                    <th>金額</th>
+                    <th>建立時間</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {allOrders.slice(0, 20).map((order) => (
+                    <tr key={order.id}>
+                      <td>#{order.id}</td>
+                      <td>
+                        <span className={`badge ${orderStatusClass(order.status)}`}>
+                          {orderStatusLabel[order.status]}
+                        </span>
+                      </td>
+                      <td>{orderTypeLabel[order.orderType]}</td>
+                      <td>${order.total}</td>
+                      <td>{formatDateTime(order.createdAt)}</td>
+                      <td>
+                        <button
+                          className="btn btn-xs btn-outline"
+                          onClick={() => void loadAdminOrderDetail(order.id)}
+                        >
+                          詳情
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </article>
+
+        <aside className="card bg-base-100 shadow-md h-fit">
+          <div className="card-body">
+            <h3 className="card-title">訂單詳情</h3>
+            {adminOrderDetail ? (
+              <div className="space-y-3 text-sm">
+                <p className="font-semibold">訂單 #{adminOrderDetail.id}</p>
+                <p>
+                  {orderStatusLabel[adminOrderDetail.status]} /{" "}
+                  {orderTypeLabel[adminOrderDetail.orderType]} / $
+                  {adminOrderDetail.total}
+                </p>
+                <ul className="space-y-1">
+                  {adminOrderDetail.items.map((detail) => (
+                    <li
+                      key={`${adminOrderDetail.id}-${detail.item.id}`}
+                      className="flex justify-between gap-3"
+                    >
+                      <span>{detail.item.name} x {detail.qty}</span>
+                      <span>{orderItemStatusLabel[detail.status]}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : (
+              <p className="text-sm opacity-70">選擇一筆訂單查看詳情。</p>
+            )}
+          </div>
+        </aside>
+      </section>
+    );
+  }
+
+  function renderAdminReports() {
+    const maxPeak = Math.max(1, ...peakHours.map((item) => item.orderCount));
+
+    return (
+      <div className="grid grid-cols-1 xl:grid-cols-2 gap-5">
+        <article className="card bg-base-100 shadow-md">
+          <div className="card-body">
+            <h3 className="card-title">熱門品項</h3>
+            {popularItems.length === 0 ? (
+              <p className="text-sm opacity-70">目前沒有銷售資料。</p>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="table table-sm">
+                  <thead>
+                    <tr>
+                      <th>品項</th>
+                      <th>數量</th>
+                      <th>營收</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {popularItems.slice(0, 8).map((item) => (
+                      <tr key={item.itemId}>
+                        <td>{item.name}</td>
+                        <td>{item.qty}</td>
+                        <td>${item.revenue}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        </article>
+
+        <article className="card bg-base-100 shadow-md">
+          <div className="card-body">
+            <h3 className="card-title">尖峰時段</h3>
+            {peakHours.length === 0 ? (
+              <p className="text-sm opacity-70">目前沒有時段資料。</p>
+            ) : (
+              <div className="space-y-3">
+                {peakHours.slice(0, 8).map((peak) => (
+                  <div key={peak.hour}>
+                    <div className="flex justify-between text-sm">
+                      <span>{String(peak.hour).padStart(2, "0")}:00</span>
+                      <span>{peak.orderCount} 筆</span>
+                    </div>
+                    <progress
+                      className="progress progress-primary w-full"
+                      value={peak.orderCount}
+                      max={maxPeak}
+                    />
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </article>
+      </div>
+    );
+  }
+
   function renderAdminView() {
     if (!canUseAdmin(user)) return renderLoginPanel("admin");
 
@@ -1624,8 +3277,10 @@ export default function App() {
       <section className="space-y-6">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
-            <h2 className="text-3xl font-bold">後台管理</h2>
-            <p className="text-sm opacity-70">boss 權限：報表、桌位、庫存、菜單</p>
+            <h2 className="text-3xl font-bold">老闆後台</h2>
+            <p className="text-sm opacity-70">
+              boss 權限：報表、訂單、桌位、庫存、菜單。
+            </p>
           </div>
           <button
             className="btn btn-outline"
@@ -1638,11 +3293,20 @@ export default function App() {
 
         {adminLoading ? (
           <div className="alert">
-            <span>讀取後台資料中...</span>
+            <span>讀取後台資料...</span>
           </div>
         ) : (
           <>
-            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
+            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-5 gap-4">
+              <div className="stats shadow bg-base-100">
+                <div className="stat">
+                  <div className="stat-title">系統</div>
+                  <div className="stat-value text-lg">{health?.status ?? "-"}</div>
+                  <div className="stat-desc">
+                    Google {health?.auth?.googleConfigured ? "已設定" : "未設定"}
+                  </div>
+                </div>
+              </div>
               <div className="stats shadow bg-base-100">
                 <div className="stat">
                   <div className="stat-title">營收</div>
@@ -1665,7 +3329,7 @@ export default function App() {
               </div>
               <div className="stats shadow bg-base-100">
                 <div className="stat">
-                  <div className="stat-title">空桌</div>
+                  <div className="stat-title">可用桌位</div>
                   <div className="stat-value text-success">
                     {turnoverReport?.availableTables ?? 0}
                   </div>
@@ -1680,170 +3344,17 @@ export default function App() {
                   <div className="stat-value text-warning">
                     {lowStockIngredients.length}
                   </div>
-                  <div className="stat-desc">需要補貨</div>
+                  <div className="stat-desc">需補貨食材</div>
                 </div>
               </div>
             </div>
 
+            {renderAdminReports()}
+            {renderAdminOrders()}
             {renderMenuManager()}
-
-            <div className="grid grid-cols-1 xl:grid-cols-2 gap-5">
-              <article className="card bg-base-100 shadow-md">
-                <div className="card-body">
-                  <h3 className="card-title">熱門品項</h3>
-                  {popularItems.length === 0 ? (
-                    <p className="text-sm opacity-70">目前沒有銷售資料。</p>
-                  ) : (
-                    <div className="overflow-x-auto">
-                      <table className="table table-sm">
-                        <thead>
-                          <tr>
-                            <th>品項</th>
-                            <th>數量</th>
-                            <th>營收</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {popularItems.slice(0, 8).map((item) => (
-                            <tr key={item.itemId}>
-                              <td>{item.name}</td>
-                              <td>{item.qty}</td>
-                              <td>${item.revenue}</td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  )}
-                </div>
-              </article>
-
-              <article className="card bg-base-100 shadow-md">
-                <div className="card-body">
-                  <h3 className="card-title">尖峰時段</h3>
-                  {peakHours.length === 0 ? (
-                    <p className="text-sm opacity-70">目前沒有時段資料。</p>
-                  ) : (
-                    <div className="space-y-3">
-                      {peakHours.slice(0, 6).map((peak) => (
-                        <div key={peak.hour}>
-                          <div className="flex justify-between text-sm">
-                            <span>{String(peak.hour).padStart(2, "0")}:00</span>
-                            <span>{peak.orderCount} 筆</span>
-                          </div>
-                          <progress
-                            className="progress progress-primary w-full"
-                            value={peak.orderCount}
-                            max={Math.max(
-                              ...peakHours.map((item) => item.orderCount),
-                            )}
-                          />
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              </article>
-            </div>
-
-            <div className="grid grid-cols-1 xl:grid-cols-2 gap-5">
-              <article className="card bg-base-100 shadow-md">
-                <div className="card-body">
-                  <h3 className="card-title">桌位</h3>
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                    {tables.map((table) => (
-                      <div
-                        key={table.id}
-                        className="rounded-lg border border-base-300 p-3"
-                      >
-                        <div className="flex items-center justify-between">
-                          <p className="font-semibold">{table.code}</p>
-                          <span className="badge badge-outline">
-                            {tableStatusLabel[table.status]}
-                          </span>
-                        </div>
-                        <p className="text-sm opacity-70">{table.capacity} 人桌</p>
-                        <div className="mt-3 flex flex-wrap gap-2">
-                          {table.status === "available" ? (
-                            <button
-                              className="btn btn-xs btn-outline"
-                              onClick={() =>
-                                void updateTableStatus(table.id, "seat")
-                              }
-                              disabled={operationId === `table-${table.id}-seat`}
-                            >
-                              入座
-                            </button>
-                          ) : null}
-                          {["seated", "dining", "reserved"].includes(
-                            table.status,
-                          ) ? (
-                            <button
-                              className="btn btn-xs btn-outline"
-                              onClick={() =>
-                                void updateTableStatus(table.id, "leave")
-                              }
-                              disabled={operationId === `table-${table.id}-leave`}
-                            >
-                              離桌
-                            </button>
-                          ) : null}
-                          {table.status === "cleaning" ? (
-                            <button
-                              className="btn btn-xs btn-outline"
-                              onClick={() =>
-                                void updateTableStatus(table.id, "clean")
-                              }
-                              disabled={operationId === `table-${table.id}-clean`}
-                            >
-                              清潔完成
-                            </button>
-                          ) : null}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              </article>
-
-              <article className="card bg-base-100 shadow-md">
-                <div className="card-body">
-                  <h3 className="card-title">庫存</h3>
-                  <div className="overflow-x-auto">
-                    <table className="table table-sm">
-                      <thead>
-                        <tr>
-                          <th>原料</th>
-                          <th>庫存</th>
-                          <th>安全量</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {ingredients.map((ingredient) => (
-                          <tr key={ingredient.id}>
-                            <td>{ingredient.name}</td>
-                            <td>
-                              {ingredient.stock} {ingredient.unit}
-                            </td>
-                            <td>
-                              <span
-                                className={`badge ${
-                                  ingredient.stock <= ingredient.reorderLevel
-                                    ? "badge-warning"
-                                    : "badge-outline"
-                                }`}
-                              >
-                                {ingredient.reorderLevel}
-                              </span>
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                </div>
-              </article>
-            </div>
+            {renderRecipeManager()}
+            {renderTableManager()}
+            {renderIngredientManager()}
           </>
         )}
       </section>
@@ -1900,7 +3411,7 @@ export default function App() {
             }`}
             onClick={() => setView("admin")}
           >
-            後台
+            老闆後台
           </button>
         </div>
         <div className="flex-none w-full lg:w-auto">
@@ -1922,7 +3433,7 @@ export default function App() {
             </button>
             {user ? (
               <button className="btn btn-sm" onClick={handleLogout}>
-                登出
+                {isGuestUser(user) ? "結束訪客" : "登出"}
               </button>
             ) : null}
           </div>
@@ -1950,7 +3461,7 @@ export default function App() {
           />
           <aside className="fixed right-0 top-0 h-full w-full max-w-md bg-base-100 shadow-2xl z-10 flex flex-col">
             <div className="p-4 border-b border-base-300 flex items-center justify-between">
-              <h2 className="text-xl font-bold">購物車明細</h2>
+              <h2 className="text-xl font-bold">購物車</h2>
               <button
                 className="btn btn-sm btn-ghost"
                 onClick={() => setIsCartOpen(false)}
@@ -1960,27 +3471,63 @@ export default function App() {
             </div>
 
             <div className="p-4 flex-1 overflow-auto">
+              <div className="mb-4 rounded-lg bg-base-200 p-3 text-sm">
+                <div className="flex items-center justify-between gap-3">
+                  <span className="font-semibold">用餐方式</span>
+                  <span>{orderTypeLabel[orderType]}</span>
+                </div>
+                {orderType === "takeout" ? (
+                  <div className="mt-1 flex items-center justify-between gap-3">
+                    <span className="font-semibold">包裝方式</span>
+                    <span>{packageTypeLabel[packageType]}</span>
+                  </div>
+                ) : (
+                  <div className="mt-1 flex items-center justify-between gap-3">
+                    <span className="font-semibold">桌位</span>
+                    <span>
+                      {availableTables.find((table) => table.id === selectedTableId)
+                        ?.code ?? "未選擇"}
+                    </span>
+                  </div>
+                )}
+              </div>
               {cartDetails.length === 0 ? (
                 <div className="alert">
                   <span>購物車目前是空的。</span>
                 </div>
               ) : (
-                <ul className="space-y-3">
+                <div className="space-y-3">
                   {cartDetails.map((detail) => (
-                    <li
+                    <article
                       key={detail.itemId}
-                      className="p-3 rounded-lg bg-base-200 flex items-center justify-between"
+                      className="rounded-lg border border-base-300 bg-base-200 p-3"
                     >
-                      <div>
-                        <p className="font-semibold">{detail.item.name}</p>
-                        <p className="text-sm opacity-70">
-                          單價 ${detail.item.price} x {detail.qty}
-                        </p>
+                      <div className="flex items-start justify-between gap-3">
+                        <div>
+                          <p className="font-semibold">{detail.item.name}</p>
+                          <p className="text-xs opacity-70">
+                            {detail.item.category}
+                          </p>
+                        </div>
+                        <span className="badge badge-outline">x {detail.qty}</span>
                       </div>
-                      <p className="font-bold">${detail.subtotal}</p>
-                    </li>
+                      <div className="mt-3 grid grid-cols-3 gap-2 text-sm">
+                        <div>
+                          <span className="opacity-70">單價</span>
+                          <p className="font-semibold">${detail.item.price}</p>
+                        </div>
+                        <div>
+                          <span className="opacity-70">數量</span>
+                          <p className="font-semibold">{detail.qty}</p>
+                        </div>
+                        <div className="text-right">
+                          <span className="opacity-70">小計</span>
+                          <p className="font-bold">${detail.subtotal}</p>
+                        </div>
+                      </div>
+                    </article>
                   ))}
-                </ul>
+                </div>
               )}
             </div>
 
@@ -1990,7 +3537,7 @@ export default function App() {
                 <span>{cartItemCount}</span>
               </div>
               <div className="flex items-center justify-between text-lg font-bold">
-                <span>付款金額</span>
+                <span>總金額</span>
                 <span>${cartTotal}</span>
               </div>
               <button

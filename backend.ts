@@ -46,6 +46,7 @@ import {
   pickupVerificationResponseSchema,
   pickupVerifyBodySchema,
   productIngredientsResponseSchema,
+  registerBodySchema,
   reportQuerySchema,
   sessionResponseSchema,
   setProductIngredientsBodySchema,
@@ -485,6 +486,50 @@ app.onAfterHandle(({ request, set }) => {
 });
 
 app.post(
+  "/api/auth/register",
+  async ({ body, set }) => {
+    if (roleForEmail(body.email) !== "customer") {
+      set.status = 409;
+      return { error: "RESERVED_EMAIL" };
+    }
+
+    const result = await store.register({
+      email: body.email,
+      name: body.name,
+      password: body.password,
+      phone: body.phone,
+    });
+
+    if (!result.ok) {
+      set.status = 409;
+      return { error: result.code };
+    }
+
+    const sessionUser: SessionUser = {
+      id: result.user.id,
+      email: result.user.email,
+      name: result.user.name,
+      role: "customer",
+    };
+
+    set.status = 201;
+    set.headers["set-cookie"] = createLocalSessionCookie(sessionUser);
+    return { data: sessionUser };
+  },
+  {
+    body: registerBodySchema,
+    detail: {
+      tags: ["auth"],
+      summary: "Register a customer account",
+    },
+    response: {
+      201: loginResponseSchema,
+      409: apiErrorResponseSchema,
+    },
+  },
+);
+
+app.post(
   "/api/auth/login",
   ({ body, set }) => {
     const configuredUser = configuredCredentialLogin({
@@ -880,6 +925,21 @@ app.post(
       return { data: orderToResponse(existingOrder) };
     }
 
+    if (orderInput.orderType === "dine_in") {
+      if (!orderInput.tableId) {
+        set.status = 400;
+        return { error: "TABLE_REQUIRED" };
+      }
+
+      const selectedTable = tables.find(
+        (table) => table.id === orderInput.tableId,
+      );
+      if (!selectedTable || selectedTable.status !== "available") {
+        set.status = 409;
+        return { error: "TABLE_NOT_AVAILABLE" };
+      }
+    }
+
     const newOrder = await store.createOrder({
       userId: user.id,
       orderType: orderInput.orderType,
@@ -994,6 +1054,14 @@ app.patch(
       return { error: "Unauthorized" };
     }
 
+    if (body.orderType === "dine_in" && body.tableId) {
+      const selectedTable = tables.find((table) => table.id === body.tableId);
+      if (!selectedTable || selectedTable.status !== "available") {
+        set.status = 409;
+        return { error: "TABLE_NOT_AVAILABLE" };
+      }
+    }
+
     const result = await store.configureOrder(params.id, {
       userId: user.id,
       orderType: body.orderType,
@@ -1038,6 +1106,28 @@ app.post(
     if (!user) {
       set.status = 401;
       return { error: "Unauthorized" };
+    }
+
+    const orderBeforeSubmit = store.getOrderById(params.id);
+    if (!orderBeforeSubmit) {
+      set.status = 404;
+      return { error: "ORDER_NOT_FOUND" };
+    }
+
+    const nextOrderType =
+      submitInput.orderType ?? orderBeforeSubmit.orderType ?? "takeout";
+    const nextTableId = submitInput.tableId ?? orderBeforeSubmit.tableId;
+    if (nextOrderType === "dine_in") {
+      if (!nextTableId) {
+        set.status = 400;
+        return { error: "TABLE_REQUIRED" };
+      }
+
+      const selectedTable = tables.find((table) => table.id === nextTableId);
+      if (!selectedTable || selectedTable.status !== "available") {
+        set.status = 409;
+        return { error: "TABLE_NOT_AVAILABLE" };
+      }
     }
 
     const result = await store.submitOrder(params.id, {
@@ -1568,15 +1658,10 @@ app.get("/api/tables", async ({ request, set }) => {
   response: { 200: tableListResponseSchema },
 });
 
-app.get("/api/tables/available", async ({ request, set }) => {
-  const user = await requireRole(request, set, "manager");
-  if (isAuthError(user)) {
-    return user as never;
-  }
-
+app.get("/api/tables/available", () => {
   return { data: tables.filter((table) => table.status === "available") };
 }, {
-  detail: { tags: ["tables"], summary: "List available tables" },
+  detail: { tags: ["tables"], summary: "List available tables for ordering" },
 });
 
 app.post(

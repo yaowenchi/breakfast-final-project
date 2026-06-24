@@ -134,6 +134,50 @@ export class PgStore implements Store {
     };
   }
 
+  async register(input: {
+    email: string;
+    name: string;
+    password: string;
+    phone?: string;
+  }): Promise<
+    | { ok: true; user: Omit<User, "password"> }
+    | { ok: false; code: "EMAIL_EXISTS" }
+  > {
+    const email = input.email.trim().toLowerCase();
+    const existingUser = this.users.find(
+      (user) => user.email.trim().toLowerCase() === email,
+    );
+    if (existingUser) {
+      return { ok: false, code: "EMAIL_EXISTS" };
+    }
+
+    try {
+      const [inserted] = await db
+        .insert(usersTable)
+        .values({
+          email,
+          name: input.name.trim(),
+          password: input.password,
+          role: "customer",
+        })
+        .returning();
+
+      const newUser: User = {
+        id: String(inserted.id),
+        email: inserted.email,
+        name: inserted.name,
+        password: inserted.password,
+        phone: input.phone,
+        role: (inserted.role as User["role"]) ?? "customer",
+      };
+
+      this.users.push(newUser);
+      return { ok: true, user: toSafeUser(newUser) };
+    } catch {
+      return { ok: false, code: "EMAIL_EXISTS" };
+    }
+  }
+
   getUserById(userId: string): Omit<User, "password"> | undefined {
     const user = this.users.find((targetUser) => targetUser.id === userId);
     return user ? toSafeUser(user) : undefined;

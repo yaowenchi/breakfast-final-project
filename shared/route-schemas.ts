@@ -37,6 +37,13 @@ export const loginBodySchema = z.object({
   password: z.string().min(1),
 });
 
+export const registerBodySchema = z.object({
+  email: z.string().email(),
+  name: z.string().min(1),
+  password: z.string().min(4),
+  phone: z.string().optional(),
+});
+
 export const loginResponseSchema = z.object({
   data: sessionUserSchema,
 });

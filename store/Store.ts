@@ -28,6 +28,7 @@ export type OrderMutationErrorCode =
   | "PICKUP_CODE_INVALID";
 
 export type LoginErrorCode = "INVALID_CREDENTIALS";
+export type RegisterErrorCode = "EMAIL_EXISTS" | "RESERVED_EMAIL";
 
 export interface Store {
   init(): Promise<void>;
@@ -38,6 +39,15 @@ export interface Store {
   }):
     | { ok: true; user: Omit<User, "password"> }
     | { ok: false; code: LoginErrorCode };
+  register(input: {
+    email: string;
+    name: string;
+    password: string;
+    phone?: string;
+  }): Promise<
+    | { ok: true; user: Omit<User, "password"> }
+    | { ok: false; code: RegisterErrorCode }
+  >;
   getUserById(userId: string): Omit<User, "password"> | undefined;
 
   getMenu(): ReadonlyArray<MenuItem>;
